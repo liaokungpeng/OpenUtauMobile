@@ -1,0 +1,1266 @@
+diff --git a/OpenUtauMobile/Utils/AutoTune/AutoTuneEngine.cs b/OpenUtauMobile/Utils/AutoTune/AutoTuneEngine.cs
+new file mode 100644
+index 0000000..b90aa66
+--- /dev/null
++++ b/OpenUtauMobile/Utils/AutoTune/AutoTuneEngine.cs
+@@ -0,0 +1,309 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using OpenUtau.Core;
++using OpenUtau.Core.Format;
++using UstxConst = OpenUtau.Core.Format.Ustx;
++using OpenUtau.Core.Ustx;
++
++namespace OpenUtauMobile.Utils.AutoTune
++{
++    /// <summary>
++    /// 调音参数集合。
++    /// 对应桌面版 OpenUtau 在「音符属性 / 音高锚点 / 颤音 / 表情」里可以调的项，
++    /// 只保留移动端真正用得上的数值项，单位尽量与桌面版保持一致：
++    ///   - 音高类：0.1 半音（PitchPoint.Y 的单位）
++    ///   - 颤音类：与 UVibrato 相同（length/in/out/shift/volLink 为百分比，period 为毫秒，depth 为音分）
++    /// </summary>
++    public class AutoTuneSettings
++    {
++        /// <summary>滑音长度（毫秒）：从起音音高滑到本音高所需的时间。</summary>
++        public float PortamentoMs = 80f;
++        /// <summary>滑音提前量（毫秒）：把滑音起点提前到音符开始之前，仅对连音音符生效。</summary>
++        public float PortamentoLeadMs = 0f;
++        /// <summary>起音下探深度（音分）：非连音时从低于本音高的位置滑进来。</summary>
++        public float ScoopCents = 50f;
++        /// <summary>过冲（音分）：滑到位后略微冲过头再回落，用来模拟人声。</summary>
++        public float OvershootCents = 0f;
++        /// <summary>随机音准抖动（音分）：每个音符结尾的随机偏移。</summary>
++        public float JitterCents = 6f;
++        /// <summary>短于该时长（毫秒）的音符不做滑音。</summary>
++        public float MinNoteMs = 60f;
++
++        /// <summary>是否写入颤音。</summary>
++        public bool VibratoEnabled = true;
++        /// <summary>颤音占音符长度的百分比。</summary>
++        public float VibratoLengthPct = 35f;
++        /// <summary>颤音周期（毫秒）。</summary>
++        public float VibratoPeriodMs = 175f;
++        /// <summary>颤音深度（音分）。</summary>
++        public float VibratoDepthCents = 25f;
++        /// <summary>颤音淡入（占颤音长度的百分比）。</summary>
++        public float VibratoInPct = 25f;
++        /// <summary>颤音淡出（占颤音长度的百分比）。</summary>
++        public float VibratoOutPct = 25f;
++        /// <summary>颤音相位偏移（百分比）。</summary>
++        public float VibratoShiftPct = 0f;
++        /// <summary>颤音整体漂移（百分比）。</summary>
++        public float VibratoDriftPct = 0f;
++        /// <summary>颤音与音量联动（百分比）。</summary>
++        public float VibratoVolLinkPct = 0f;
++        /// <summary>短于该时长（毫秒）的音符不写颤音。</summary>
++        public float VibratoMinNoteMs = 300f;
++
++        /// <summary>是否同时把表情值写到音符上。</summary>
++        public bool ApplyExpressions = false;
++        /// <summary>力度（dyn）百分比，0~100 映射到表情描述符的 min~max。</summary>
++        public float DynPct = 50f;
++        /// <summary>张力（tenc）百分比。</summary>
++        public float TensionPct = 50f;
++        /// <summary>气声（brec）百分比。</summary>
++        public float BreathPct = 50f;
++        /// <summary>性别（genc）百分比。</summary>
++        public float GenderPct = 50f;
++        /// <summary>声线（voic）百分比。</summary>
++        public float VoicingPct = 50f;
++        /// <summary>力度参数（vel）百分比。</summary>
++        public float VelocityPct = 50f;
++    }
++
++    /// <summary>
++    /// 自动调音核心：只负责「算出要下的命令」，不碰界面，方便单独测试。
++    /// 生成的是音符自带的音高锚点（UNote.pitch）和颤音（UNote.vibrato），
++    /// 与桌面版手动调出来的数据完全同构，导回桌面版也能继续编辑。
++    /// </summary>
++    public static class AutoTuneEngine
++    {
++        /// <summary>与音符绑定的表情缩写，顺序决定写入顺序。</summary>
++        public static readonly string[] NoteExpressionAbbrs = {
++            UstxConst.DYN, UstxConst.TENC, UstxConst.BREC, UstxConst.GENC, UstxConst.VOIC, UstxConst.VEL,
++        };
++
++        /// <summary>
++        /// 生成应用自动调音所需的命令列表（音高锚点 + 颤音 + 可选表情）。
++        /// </summary>
++        public static List<UCommand> BuildCommands(
++            UProject project,
++            UVoicePart part,
++            IReadOnlyList<UNote> notes,
++            AutoTuneSettings settings)
++        {
++            var commands = new List<UCommand>();
++            if (project == null || part == null || notes == null || notes.Count == 0)
++            {
++                return commands;
++            }
++
++            // 固定种子：同一份工程反复应用的结果一致，避免每次听感都不一样。
++            var random = new Random(20260101);
++            var targets = notes.Where(n => n != null && !IsRest(n)).ToList();
++            if (targets.Count == 0)
++            {
++                return commands;
++            }
++
++            foreach (var note in targets)
++            {
++                commands.Add(new SetPitchPointsCommand(part, note, BuildPitch(note, settings, random)));
++                commands.Add(new SetVibratoCommand(part, note, BuildVibrato(note, settings)));
++            }
++
++            if (settings.ApplyExpressions)
++            {
++                var track = part.trackNo >= 0 && part.trackNo < project.tracks.Count
++                    ? project.tracks[part.trackNo]
++                    : null;
++                if (track != null)
++                {
++                    foreach (var item in new[] {
++                        (UstxConst.DYN, settings.DynPct),
++                        (UstxConst.TENC, settings.TensionPct),
++                        (UstxConst.BREC, settings.BreathPct),
++                        (UstxConst.GENC, settings.GenderPct),
++                        (UstxConst.VOIC, settings.VoicingPct),
++                        (UstxConst.VEL, settings.VelocityPct),
++                    })
++                    {
++                        if (!project.expressions.TryGetValue(item.Item1, out var descriptor))
++                        {
++                            continue;
++                        }
++                        float value = descriptor.min + (descriptor.max - descriptor.min) * Clamp(item.Item2, 0f, 100f) / 100f;
++                        commands.Add(new SetNotesSameExpressionCommand(
++                            project, track, part, targets, item.Item1, value));
++                    }
++                }
++            }
++
++            return commands;
++        }
++
++        /// <summary>
++        /// 生成清除音高锚点与颤音所需的命令。
++        /// </summary>
++        public static List<UCommand> BuildClearCommands(UVoicePart part, IReadOnlyList<UNote> notes)
++        {
++            var commands = new List<UCommand>();
++            if (part == null || notes == null)
++            {
++                return commands;
++            }
++            foreach (var note in notes.Where(n => n != null && !IsRest(n)))
++            {
++                commands.Add(new ResetPitchPointsCommand(part, note));
++                var vibrato = new UVibrato { length = 0f };
++                commands.Add(new SetVibratoCommand(part, note, vibrato));
++            }
++            return commands;
++        }
++
++        /// <summary>
++        /// 算出单个音符的音高锚点。
++        /// 说明：PitchPoint.X 是相对音符开始的毫秒数，Y 是 0.1 半音为单位的偏移。
++        /// 连音时从上一个音符的音高滑入，非连音时从下方「下探」滑入。
++        /// </summary>
++        public static UPitch BuildPitch(UNote note, AutoTuneSettings settings, Random random)
++        {
++            var pitch = new UPitch();
++            double durationMs = Math.Max(1.0, note.DurationMs);
++            float duration = (float)durationMs;
++
++            float portamento = Clamp(settings.PortamentoMs, 0f, duration * 0.9f);
++            UNote? prev = note.Prev;
++            bool legato = prev != null
++                && prev.End == note.position
++                && !IsRest(prev);
++            bool longEnough = durationMs >= settings.MinNoteMs;
++
++            float lead = 0f;
++            if (legato && settings.PortamentoLeadMs > 0f)
++            {
++                // 提前量不能超过滑音长度，否则起点会落到上一个音符里造成重复叠加。
++                lead = Clamp(settings.PortamentoLeadMs, 0f, portamento);
++            }
++
++            float startY;
++            if (!longEnough)
++            {
++                // 短音不做任何处理，保持原样。
++                pitch.AddPoint(new PitchPoint(0f, 0f, PitchPointShape.io));
++                pitch.AddPoint(new PitchPoint(duration, 0f, PitchPointShape.io));
++                return pitch;
++            }
++
++            if (legato)
++            {
++                // 从上一个音符的音高出发。
++                startY = Clamp((prev!.tone - note.tone) * 10f, -240f, 240f);
++            }
++            else if (settings.ScoopCents > 0f)
++            {
++                // 从下方滑入，模拟换气后的起音。
++                startY = -Clamp(settings.ScoopCents, 0f, 600f) / 10f;
++            }
++            else
++            {
++                startY = 0f;
++            }
++
++            float startX = lead > 0f ? -lead : 0f;
++            float settleX = startX + Math.Max(1f, portamento);
++            settleX = Math.Min(settleX, duration);
++            float jitterY = settings.JitterCents > 0f
++                ? (float)(random.NextDouble() * 2.0 - 1.0) * Clamp(settings.JitterCents, 0f, 100f) / 10f
++                : 0f;
++
++            pitch.AddPoint(new PitchPoint(startX, startY, PitchPointShape.io));
++            pitch.AddPoint(new PitchPoint(settleX, 0f, PitchPointShape.io));
++
++            float overshoot = Clamp(settings.OvershootCents, 0f, 300f) / 10f;
++            if (overshoot > 0.01f && duration - settleX > 40f)
++            {
++                // 冲过头再回落。
++                float peakX = Math.Min(settleX + Math.Max(20f, (duration - settleX) * 0.25f), duration - 1f);
++                float backX = Math.Min(peakX + Math.Max(30f, (duration - settleX) * 0.3f), duration);
++                pitch.AddPoint(new PitchPoint(peakX, overshoot, PitchPointShape.io));
++                pitch.AddPoint(new PitchPoint(backX, jitterY, PitchPointShape.io));
++            }
++            else if (duration - settleX > 1f)
++            {
++                pitch.AddPoint(new PitchPoint(duration, jitterY, PitchPointShape.io));
++            }
++
++            return Normalize(pitch, duration);
++        }
++
++        /// <summary>
++        /// 算出单个音符的颤音参数。
++        /// </summary>
++        public static UVibrato BuildVibrato(UNote note, AutoTuneSettings settings)
++        {
++            var vibrato = new UVibrato();
++            float period = Clamp(settings.VibratoPeriodMs, 5f, 500f);
++            // 至少要容得下 1.5 个周期，否则短音符上会出现半截「鼓包」而不是颤音。
++            float minDuration = Math.Max(settings.VibratoMinNoteMs, period * 1.5f);
++            if (!settings.VibratoEnabled || note.DurationMs < minDuration)
++            {
++                vibrato.length = 0f;
++                return vibrato;
++            }
++            vibrato.length = Clamp(settings.VibratoLengthPct, 1f, 100f);
++            vibrato.period = period;
++            vibrato.depth = Clamp(settings.VibratoDepthCents, 5f, 200f);
++            // in / out 的 setter 会互相挤占，先设 in 再设 out，最后按需回写 in。
++            vibrato.@in = Clamp(settings.VibratoInPct, 0f, 100f);
++            vibrato.@out = Clamp(settings.VibratoOutPct, 0f, 100f);
++            vibrato.shift = Clamp(settings.VibratoShiftPct, 0f, 100f);
++            vibrato.drift = Clamp(settings.VibratoDriftPct, -100f, 100f);
++            vibrato.volLink = Clamp(settings.VibratoVolLinkPct, -100f, 100f);
++            return vibrato;
++        }
++
++        /// <summary>
++        /// 排序、去重、并把锚点收进音符范围，避免出现 X 重复或越界的点。
++        /// </summary>
++        private static UPitch Normalize(UPitch pitch, float duration)
++        {
++            var points = pitch.data
++                .OrderBy(p => p.X)
++                .ToList();
++            pitch.data.Clear();
++            float lastX = float.NegativeInfinity;
++            foreach (var point in points)
++            {
++                float x = Math.Min(point.X, duration);
++                if (x - lastX < 1f)
++                {
++                    continue;
++                }
++                point.X = x;
++                pitch.data.Add(point);
++                lastX = x;
++            }
++            if (pitch.data.Count == 0)
++            {
++                pitch.data.Add(new PitchPoint(0f, 0f, PitchPointShape.io));
++            }
++            if (pitch.data.Count == 1)
++            {
++                pitch.data.Add(new PitchPoint(duration, pitch.data[0].Y, PitchPointShape.io));
++            }
++            return pitch;
++        }
++
++        /// <summary>休止符判定：歌词为 R（不区分大小写）。</summary>
++        public static bool IsRest(UNote note)
++        {
++            return note == null || string.Equals(note.lyric?.Trim(), "R", StringComparison.OrdinalIgnoreCase);
++        }
++
++        private static float Clamp(float value, float min, float max)
++        {
++            if (float.IsNaN(value))
++            {
++                return min;
++            }
++            return Math.Min(max, Math.Max(min, value));
++        }
++    }
++}
+diff --git a/OpenUtauMobile/Utils/AutoTune/AutoTunePresetStore.cs b/OpenUtauMobile/Utils/AutoTune/AutoTunePresetStore.cs
+new file mode 100644
+index 0000000..19c341e
+--- /dev/null
++++ b/OpenUtauMobile/Utils/AutoTune/AutoTunePresetStore.cs
+@@ -0,0 +1,305 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using OpenUtau.Core;
++using OpenUtau.Core.Util;
++
++namespace OpenUtauMobile.Utils.AutoTune
++{
++    /// <summary>
++    /// 一个调音预设。Values 的键与调音面板的滑杆键一致
++    /// （portamento / lead / scoop / overshoot / jitter / vibLength … / dyn …），
++    /// 没写的键在应用时回落到默认值。
++    /// </summary>
++    public sealed class AutoTunePreset
++    {
++        public string Name { get; init; } = string.Empty;
++        /// <summary>来源包名，用于重名时区分。</summary>
++        public string Source { get; init; } = string.Empty;
++        public Dictionary<string, double> Values { get; init; } = new();
++        public bool? Vibrato { get; init; }
++        public bool? Expressions { get; init; }
++    }
++
++    /// <summary>
++    /// 从依赖目录读取 .oudep 预设包。
++    /// 约定：包根目录下放 autotune.yaml，内容见 docs 里的说明。
++    /// </summary>
++    public static class AutoTunePresetStore
++    {
++        public const string PresetFileName = "autotune.yaml";
++
++        /// <summary>与调音面板一致的滑杆键。</summary>
++        public static readonly string[] SliderKeys =
++        {
++            "portamento", "lead", "scoop", "overshoot", "jitter",
++            "vibLength", "vibPeriod", "vibDepth", "vibIn", "vibOut",
++            "vibShift", "vibDrift", "vibVolLink",
++            "dyn", "tenc", "brec", "genc", "voic", "vel",
++        };
++
++        private static readonly Dictionary<string, string> KeyMap = BuildKeyMap();
++
++        /// <summary>
++        /// 扫描依赖目录，返回所有可用的自定义预设。
++        /// 单个包出错不影响其他包，错误通过 onError 报告。
++        /// </summary>
++        public static List<AutoTunePreset> Load(string? dependenciesRoot = null, Action<string>? onError = null)
++        {
++            var presets = new List<AutoTunePreset>();
++            string? root = dependenciesRoot;
++            if (string.IsNullOrEmpty(root))
++            {
++                try
++                {
++                    root = PathManager.Inst.DependencyPath;
++                }
++                catch (Exception ex)
++                {
++                    onError?.Invoke($"无法定位依赖目录：{ex.Message}");
++                    return presets;
++                }
++            }
++            if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
++            {
++                return presets;
++            }
++
++            string[] dirs;
++            try
++            {
++                dirs = Directory.GetDirectories(root);
++            }
++            catch (Exception ex)
++            {
++                onError?.Invoke($"无法读取依赖目录：{ex.Message}");
++                return presets;
++            }
++            Array.Sort(dirs, StringComparer.OrdinalIgnoreCase);
++
++            foreach (var dir in dirs)
++            {
++                string file = Path.Combine(dir, PresetFileName);
++                if (!File.Exists(file))
++                {
++                    continue;
++                }
++                string packName = Path.GetFileName(dir);
++                try
++                {
++                    string text = File.ReadAllText(file);
++                    presets.AddRange(Parse(text, packName));
++                }
++                catch (Exception ex)
++                {
++                    onError?.Invoke($"{packName}: {ex.Message}");
++                }
++            }
++            return presets;
++        }
++
++        /// <summary>
++        /// 解析一个 autotune.yaml。格式：
++        /// <code>
++        /// presets:
++        ///   - name: 柔滑女声
++        ///     portamento: 130
++        ///     vib_length: 50
++        ///     vibrato: true
++        /// </code>
++        /// 键名大小写、下划线、连字符都可以随意写。
++        /// </summary>
++        public static List<AutoTunePreset> Parse(string yaml, string source = "")
++        {
++            var result = new List<AutoTunePreset>();
++            if (string.IsNullOrWhiteSpace(yaml))
++            {
++                return result;
++            }
++
++            List<Dictionary<string, object?>>? entries = null;
++            Exception? wrappedError = null;
++            try
++            {
++                var wrapped = OpenUtau.Core.Yaml.DefaultDeserializer.Deserialize<PresetFile>(yaml);
++                entries = wrapped?.presets;
++            }
++            catch (Exception ex)
++            {
++                wrappedError = ex;
++                entries = null;
++            }
++
++            if (entries == null)
++            {
++                try
++                {
++                    // 也允许直接写成顶层列表
++                    entries = OpenUtau.Core.Yaml.DefaultDeserializer.Deserialize<List<Dictionary<string, object?>>>(yaml);
++                }
++                catch (Exception) when (wrappedError != null)
++                {
++                    throw new FormatException($"autotune.yaml 格式不对：{wrappedError.Message}", wrappedError);
++                }
++            }
++
++            if (entries == null)
++            {
++                return result;
++            }
++
++            foreach (var entry in entries)
++            {
++                if (entry == null)
++                {
++                    continue;
++                }
++                AutoTunePreset? preset = ToPreset(entry, source);
++                if (preset != null)
++                {
++                    result.Add(preset);
++                }
++            }
++            return result;
++        }
++
++        private static AutoTunePreset? ToPreset(Dictionary<string, object?> entry, string source)
++        {
++            string name = string.Empty;
++            var values = new Dictionary<string, double>();
++            bool? vibrato = null;
++            bool? expressions = null;
++
++            foreach (var pair in entry)
++            {
++                string? key = NormalizeKey(pair.Key);
++                if (key == null)
++                {
++                    continue;
++                }
++                switch (key)
++                {
++                    case "name":
++                        name = pair.Value?.ToString()?.Trim() ?? string.Empty;
++                        continue;
++                    case "vibrato":
++                        vibrato = ToBool(pair.Value) ?? vibrato;
++                        continue;
++                    case "expressions":
++                    case "expression":
++                        expressions = ToBool(pair.Value) ?? expressions;
++                        continue;
++                }
++                if (!KeyMap.TryGetValue(key, out var sliderKey))
++                {
++                    continue;
++                }
++                double? value = ToDouble(pair.Value);
++                if (value.HasValue)
++                {
++                    values[sliderKey] = value.Value;
++                }
++            }
++
++            if (string.IsNullOrWhiteSpace(name))
++            {
++                return null;
++            }
++            return new AutoTunePreset
++            {
++                Name = name,
++                Source = source,
++                Values = values,
++                Vibrato = vibrato,
++                Expressions = expressions,
++            };
++        }
++
++        private static string? NormalizeKey(string? key)
++        {
++            if (string.IsNullOrWhiteSpace(key))
++            {
++                return null;
++            }
++            var chars = key.Trim().ToLowerInvariant().Where(c => c != '_' && c != '-' && c != ' ').ToArray();
++            return chars.Length == 0 ? null : new string(chars);
++        }
++
++        private static double? ToDouble(object? value)
++        {
++            if (value == null)
++            {
++                return null;
++            }
++            if (value is double d)
++            {
++                return d;
++            }
++            if (value is int i)
++            {
++                return i;
++            }
++            if (value is float f)
++            {
++                return f;
++            }
++            string text = value.ToString()?.Trim() ?? string.Empty;
++            if (text.EndsWith("%", StringComparison.Ordinal))
++            {
++                text = text[..^1];
++            }
++            return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed)
++                ? parsed
++                : null;
++        }
++
++        private static bool? ToBool(object? value)
++        {
++            if (value == null)
++            {
++                return null;
++            }
++            if (value is bool b)
++            {
++                return b;
++            }
++            string text = value.ToString()?.Trim().ToLowerInvariant() ?? string.Empty;
++            return text switch
++            {
++                "true" or "yes" or "on" or "1" or "是" or "开" => true,
++                "false" or "no" or "off" or "0" or "否" or "关" => false,
++                _ => null,
++            };
++        }
++
++        private static Dictionary<string, string> BuildKeyMap()
++        {
++            var map = new Dictionary<string, string>(StringComparer.Ordinal);
++            foreach (var key in SliderKeys)
++            {
++                string? normalized = NormalizeKey(key);
++                if (normalized != null)
++                {
++                    map[normalized] = key;
++                }
++            }
++            // 常见别名，方便手写预设
++            map["tension"] = "tenc";
++            map["breath"] = "brec";
++            map["breathiness"] = "brec";
++            map["gender"] = "genc";
++            map["voicing"] = "voic";
++            map["velocity"] = "vel";
++            map["dynamics"] = "dyn";
++            map["volume"] = "dyn";
++            return map;
++        }
++
++        private sealed class PresetFile
++        {
++            public List<Dictionary<string, object?>>? presets { get; set; }
++        }
++    }
++}
+diff --git a/OpenUtauMobile/Views/AutoTunePage.cs b/OpenUtauMobile/Views/AutoTunePage.cs
+new file mode 100644
+index 0000000..1fcb40b
+--- /dev/null
++++ b/OpenUtauMobile/Views/AutoTunePage.cs
+@@ -0,0 +1,590 @@
++using CommunityToolkit.Maui.Alerts;
++using CommunityToolkit.Maui.Core;
++using OpenUtau.Core;
++using OpenUtau.Core.Ustx;
++using OpenUtauMobile.Utils.AutoTune;
++using Serilog;
++
++namespace OpenUtauMobile.Views;
++
++/// <summary>
++/// 调音面板：把桌面版 OpenUtau 里和「调音」相关的可调项集中到一页，
++/// 一键生成音高锚点（滑音 / 起音 / 过冲 / 随机）、颤音，以及批量表情值。
++/// 写入的数据就是工程本身的 UNote.pitch 与 UNote.vibrato，
++/// 保存成 ustx 后回到桌面版可以继续逐点编辑。
++/// </summary>
++public class AutoTunePage : ContentPage
++{
++    private readonly UVoicePart _part;
++    private readonly List<UNote> _notes;
++    private readonly Dictionary<string, Slider> _sliders = new();
++    private readonly Dictionary<string, double> _values = new();
++    private readonly Dictionary<string, string> _units = new();
++    private readonly Dictionary<string, int> _decimals = new();
++    private readonly Dictionary<string, Label> _valueLabels = new();
++
++    private Picker _presetPicker = null!;
++    private Switch _vibratoSwitch = null!;
++    private Switch _expressionSwitch = null!;
++    private Label _summaryLabel = null!;
++    private Button _applyButton = null!;
++    private readonly Dictionary<string, double> _defaults = new();
++    private List<AutoTunePreset> _customPresets = new();
++    private List<string> _presetNames = new();
++    private bool _syncing;
++
++    private static readonly string[] PresetNames = {
++        "自然（推荐）", "标准", "强颤音", "电音 Auto-Tune", "古风柔滑", "朗读",
++    };
++
++    public AutoTunePage(UVoicePart part, List<UNote> notes)
++    {
++        _part = part;
++        _notes = notes ?? new List<UNote>();
++        Title = "调音";
++        _customPresets = LoadCustomPresets();
++        _presetNames = BuildPresetNames();
++
++        var root = new Grid
++        {
++            RowDefinitions =
++            {
++                new RowDefinition(GridLength.Auto),
++                new RowDefinition(GridLength.Star),
++                new RowDefinition(GridLength.Auto),
++            },
++        };
++
++        var header = BuildHeader();
++        var body = BuildBody();
++        var footer = BuildFooter();
++        root.Children.Add(header);
++        root.Children.Add(body);
++        root.Children.Add(footer);
++        Grid.SetRow(header, 0);
++        Grid.SetRow(body, 1);
++        Grid.SetRow(footer, 2);
++        Content = root;
++
++        ApplyPreset(0);
++    }
++
++    #region 界面
++
++    private View BuildHeader()
++    {
++        var back = new Button
++        {
++            Text = "‹ 返回",
++            BackgroundColor = Colors.Transparent,
++            HorizontalOptions = LayoutOptions.Start,
++        };
++        back.Clicked += async (s, e) => await Navigation.PopModalAsync();
++
++        var title = new Label
++        {
++            Text = "调音 / 自动音高",
++            FontSize = 18,
++            FontAttributes = FontAttributes.Bold,
++            HorizontalOptions = LayoutOptions.Center,
++            VerticalOptions = LayoutOptions.Center,
++        };
++
++        var header = new Grid
++        {
++            HeightRequest = 60,
++            Padding = new Thickness(8, 0),
++            ColumnDefinitions =
++            {
++                new ColumnDefinition(GridLength.Auto),
++                new ColumnDefinition(GridLength.Star),
++            },
++        };
++        header.Children.Add(back);
++        header.Children.Add(title);
++        Grid.SetColumn(title, 1);
++        return header;
++    }
++
++    private View BuildBody()
++    {
++        var stack = new VerticalStackLayout
++        {
++            Padding = new Thickness(16, 6, 16, 24),
++            Spacing = 6,
++        };
++
++        _summaryLabel = new Label
++        {
++            FontSize = 12,
++            TextColor = Colors.Gray,
++            Text = BuildSummaryText(),
++        };
++        stack.Children.Add(_summaryLabel);
++
++        stack.Children.Add(SectionTitle("预设"));
++        _presetPicker = new Picker
++        {
++            ItemsSource = new List<string>(_presetNames),
++            SelectedIndex = 0,
++        };
++        _presetPicker.SelectedIndexChanged += (s, e) =>
++        {
++            if (_syncing || _presetPicker.SelectedIndex < 0)
++            {
++                return;
++            }
++            ApplyPreset(_presetPicker.SelectedIndex);
++        };
++        stack.Children.Add(_presetPicker);
++        stack.Children.Add(new Label
++        {
++            FontSize = 11,
++            TextColor = Colors.Gray,
++            Text = _customPresets.Count > 0
++                ? $"另有 {_customPresets.Count} 个来自 .oudep 预设包"
++                : "想加自己的预设：歌手管理页右上角 → 依赖管理 → 安装 .oudep 包",
++        });
++
++        stack.Children.Add(SectionTitle("滑音 / 起音"));
++        AddSlider(stack, "portamento", "滑音长度", 0, 300, 80, "ms");
++        AddSlider(stack, "lead", "滑音提前量", 0, 150, 0, "ms");
++        AddSlider(stack, "scoop", "起音下探", 0, 300, 50, "音分");
++        AddSlider(stack, "overshoot", "过冲", 0, 150, 0, "音分");
++        AddSlider(stack, "jitter", "随机音准", 0, 60, 6, "音分");
++
++        stack.Children.Add(SectionTitle("颤音"));
++        _vibratoSwitch = new Switch { IsToggled = true, HorizontalOptions = LayoutOptions.Start };
++        stack.Children.Add(SwitchRow("启用颤音", _vibratoSwitch, "只对时长足够的音符生效"));
++        AddSlider(stack, "vibLength", "颤音长度（占音符）", 1, 100, 35, "%");
++        AddSlider(stack, "vibPeriod", "颤音周期", 60, 400, 175, "ms");
++        AddSlider(stack, "vibDepth", "颤音深度", 5, 120, 25, "音分");
++        AddSlider(stack, "vibIn", "淡入", 0, 100, 25, "%");
++        AddSlider(stack, "vibOut", "淡出", 0, 100, 25, "%");
++        AddSlider(stack, "vibShift", "相位偏移", -100, 100, 0, "%");
++        AddSlider(stack, "vibDrift", "整体漂移", -100, 100, 0, "%");
++        AddSlider(stack, "vibVolLink", "音量联动", -100, 100, 0, "%");
++
++        stack.Children.Add(SectionTitle("表情（可选批量写入）"));
++        _expressionSwitch = new Switch { IsToggled = false, HorizontalOptions = LayoutOptions.Start };
++        stack.Children.Add(SwitchRow("同时写入表情", _expressionSwitch, "50% 等于表情的默认值"));
++        AddSlider(stack, "dyn", "力度 dyn", 0, 100, 50, "%");
++        AddSlider(stack, "tenc", "张力 tenc", 0, 100, 50, "%");
++        AddSlider(stack, "brec", "气声 brec", 0, 100, 50, "%");
++        AddSlider(stack, "genc", "性别 genc", 0, 100, 50, "%");
++        AddSlider(stack, "voic", "声线 voic", 0, 100, 50, "%");
++        AddSlider(stack, "vel", "力度 vel", 0, 100, 50, "%");
++
++        stack.Children.Add(new Label
++        {
++            FontSize = 11,
++            TextColor = Colors.Gray,
++            Margin = new Thickness(0, 10, 0, 0),
++            Text = "生成结果是工程里真实的音高锚点与颤音参数，撤销、保存、导回桌面版都不受影响。",
++        });
++
++        return new ScrollView { Content = stack };
++    }
++
++    private View BuildFooter()
++    {
++        _applyButton = new Button
++        {
++            Text = "应用自动音高",
++            FontAttributes = FontAttributes.Bold,
++            IsEnabled = _notes.Count > 0,
++            HorizontalOptions = LayoutOptions.Fill,
++        };
++        _applyButton.Clicked += OnApplyClicked;
++
++        var clear = new Button
++        {
++            Text = "清除",
++            HorizontalOptions = LayoutOptions.Fill,
++        };
++        clear.Clicked += OnClearClicked;
++
++        var cancel = new Button
++        {
++            Text = "取消",
++            HorizontalOptions = LayoutOptions.Fill,
++        };
++        cancel.Clicked += async (s, e) => await Navigation.PopModalAsync();
++
++        var footer = new Grid
++        {
++            Padding = new Thickness(16, 8, 16, 16),
++            ColumnSpacing = 8,
++            ColumnDefinitions =
++            {
++                new ColumnDefinition(GridLength.Star),
++                new ColumnDefinition(GridLength.Star),
++                new ColumnDefinition(new GridLength(2, GridUnitType.Star)),
++            },
++        };
++        footer.Children.Add(clear);
++        footer.Children.Add(cancel);
++        footer.Children.Add(_applyButton);
++        Grid.SetColumn(cancel, 1);
++        Grid.SetColumn(_applyButton, 2);
++        return footer;
++    }
++
++    private static Label SectionTitle(string text)
++    {
++        return new Label
++        {
++            Text = text,
++            FontSize = 15,
++            FontAttributes = FontAttributes.Bold,
++            Margin = new Thickness(0, 14, 0, 2),
++        };
++    }
++
++    private static View SwitchRow(string text, Switch toggle, string hint)
++    {
++        var labels = new VerticalStackLayout { Spacing = 0 };
++        labels.Children.Add(new Label { Text = text, FontSize = 14 });
++        labels.Children.Add(new Label { Text = hint, FontSize = 11, TextColor = Colors.Gray });
++
++        var row = new Grid
++        {
++            ColumnDefinitions =
++            {
++                new ColumnDefinition(GridLength.Star),
++                new ColumnDefinition(GridLength.Auto),
++            },
++        };
++        row.Children.Add(labels);
++        row.Children.Add(toggle);
++        Grid.SetColumn(toggle, 1);
++        return row;
++    }
++
++    private void AddSlider(VerticalStackLayout parent, string key, string title, double min, double max, double value, string unit)
++    {
++        const int decimals = 0;
++        _values[key] = value;
++        _defaults[key] = value;
++        _units[key] = unit;
++        _decimals[key] = decimals;
++
++        var valueLabel = new Label
++        {
++            Text = Format(value, unit, decimals),
++            FontSize = 12,
++            TextColor = Colors.Gray,
++            HorizontalOptions = LayoutOptions.End,
++            VerticalOptions = LayoutOptions.Center,
++        };
++        var titleLabel = new Label
++        {
++            Text = title,
++            FontSize = 13,
++            VerticalOptions = LayoutOptions.Center,
++        };
++
++        var head = new Grid
++        {
++            ColumnDefinitions =
++            {
++                new ColumnDefinition(GridLength.Star),
++                new ColumnDefinition(GridLength.Auto),
++            },
++            Margin = new Thickness(0, 6, 0, 0),
++        };
++        head.Children.Add(titleLabel);
++        head.Children.Add(valueLabel);
++        Grid.SetColumn(valueLabel, 1);
++
++        var slider = new Slider
++        {
++            Minimum = min,
++            Maximum = max,
++            Value = Math.Clamp(value, min, max),
++        };
++        slider.ValueChanged += (s, e) =>
++        {
++            if (_syncing)
++            {
++                return;
++            }
++            _values[key] = e.NewValue;
++            valueLabel.Text = Format(e.NewValue, unit, _decimals[key]);
++        };
++
++        _sliders[key] = slider;
++        _valueLabels[key] = valueLabel;
++        parent.Children.Add(head);
++        parent.Children.Add(slider);
++    }
++
++    #endregion
++
++    #region 预设
++
++    private void ApplyPreset(int index)
++    {
++        if (index >= PresetNames.Length)
++        {
++            int customIndex = index - PresetNames.Length;
++            if (customIndex >= 0 && customIndex < _customPresets.Count)
++            {
++                ApplyCustomPreset(_customPresets[customIndex]);
++            }
++            return;
++        }
++        _syncing = true;
++        try
++        {
++            switch (index)
++            {
++                case 1: // 标准：接近桌面版默认 Portamento/Vibrato 预设
++                    SetValues(("portamento", 80), ("lead", 40), ("scoop", 40), ("overshoot", 10), ("jitter", 4),
++                        ("vibLength", 40), ("vibPeriod", 175), ("vibDepth", 30), ("vibIn", 20), ("vibOut", 20));
++                    SetVibrato(true);
++                    break;
++                case 2: // 强颤音
++                    SetValues(("portamento", 70), ("lead", 30), ("scoop", 30), ("overshoot", 0), ("jitter", 3),
++                        ("vibLength", 55), ("vibPeriod", 190), ("vibDepth", 55), ("vibIn", 25), ("vibOut", 25));
++                    SetVibrato(true);
++                    break;
++                case 3: // 电音：几乎不滑音、不颤音，音头干净
++                    SetValues(("portamento", 12), ("lead", 0), ("scoop", 0), ("overshoot", 0), ("jitter", 0),
++                        ("vibLength", 10), ("vibPeriod", 160), ("vibDepth", 8), ("vibIn", 50), ("vibOut", 50));
++                    SetVibrato(true);
++                    break;
++                case 4: // 古风柔滑：长滑音 + 慢颤音
++                    SetValues(("portamento", 150), ("lead", 80), ("scoop", 90), ("overshoot", 0), ("jitter", 8),
++                        ("vibLength", 60), ("vibPeriod", 210), ("vibDepth", 30), ("vibIn", 35), ("vibOut", 40));
++                    SetVibrato(true);
++                    break;
++                case 5: // 朗读：轻滑音，不颤
++                    SetValues(("portamento", 30), ("lead", 0), ("scoop", 20), ("overshoot", 0), ("jitter", 5));
++                    SetVibrato(false);
++                    break;
++                default: // 自然
++                    SetValues(("portamento", 80), ("lead", 0), ("scoop", 50), ("overshoot", 0), ("jitter", 6),
++                        ("vibLength", 35), ("vibPeriod", 175), ("vibDepth", 25), ("vibIn", 25), ("vibOut", 25),
++                        ("vibShift", 0), ("vibDrift", 0), ("vibVolLink", 0));
++                    SetVibrato(true);
++                    break;
++            }
++        }
++        finally
++        {
++            _syncing = false;
++        }
++    }
++
++    /// <summary>
++    /// 应用 .oudep 预设包里的预设：预设没写的参数回落到面板默认值，
++    /// 超范围的值按滑杆上下限裁剪。
++    /// </summary>
++    private void ApplyCustomPreset(AutoTunePreset preset)
++    {
++        _syncing = true;
++        try
++        {
++            foreach (var key in _values.Keys.ToList())
++            {
++                double value = preset.Values.TryGetValue(key, out double custom) ? custom : _defaults[key];
++                if (_sliders.TryGetValue(key, out var slider))
++                {
++                    value = Math.Clamp(value, slider.Minimum, slider.Maximum);
++                    slider.Value = value;
++                }
++                _values[key] = value;
++                if (_valueLabels.TryGetValue(key, out var label))
++                {
++                    label.Text = Format(value, _units[key], _decimals[key]);
++                }
++            }
++            SetVibrato(preset.Vibrato ?? true);
++            if (preset.Expressions.HasValue && _expressionSwitch != null)
++            {
++                _expressionSwitch.IsToggled = preset.Expressions.Value;
++            }
++        }
++        finally
++        {
++            _syncing = false;
++        }
++    }
++
++    private static List<AutoTunePreset> LoadCustomPresets()
++    {
++        try
++        {
++            return AutoTunePresetStore.Load(onError: message => Log.Warning("预设包问题：{Message}", message));
++        }
++        catch (Exception ex)
++        {
++            Log.Error(ex, "读取调音预设包失败");
++            return new List<AutoTunePreset>();
++        }
++    }
++
++    private List<string> BuildPresetNames()
++    {
++        var names = new List<string>(PresetNames);
++        foreach (var preset in _customPresets)
++        {
++            string label = preset.Name;
++            if (names.Contains(label) && !string.IsNullOrEmpty(preset.Source))
++            {
++                label = $"{preset.Name}（{preset.Source}）";
++            }
++            string candidate = label;
++            int suffix = 2;
++            while (names.Contains(candidate))
++            {
++                candidate = $"{label} {suffix++}";
++            }
++            names.Add(candidate);
++        }
++        return names;
++    }
++
++    private void SetValues(params (string Key, double Value)[] pairs)
++    {
++        foreach (var pair in pairs)
++        {
++            if (!_values.ContainsKey(pair.Key))
++            {
++                continue;
++            }
++            _values[pair.Key] = pair.Value;
++            if (_sliders.TryGetValue(pair.Key, out var slider))
++            {
++                slider.Value = Math.Clamp(pair.Value, slider.Minimum, slider.Maximum);
++            }
++            if (_valueLabels.TryGetValue(pair.Key, out var label))
++            {
++                label.Text = Format(pair.Value, _units[pair.Key], _decimals[pair.Key]);
++            }
++        }
++    }
++
++    private void SetVibrato(bool enabled)
++    {
++        if (_vibratoSwitch != null)
++        {
++            _vibratoSwitch.IsToggled = enabled;
++        }
++    }
++
++    #endregion
++
++    #region 执行
++
++    private AutoTuneSettings BuildSettings()
++    {
++        double Read(string key, double fallback) => _values.TryGetValue(key, out var v) ? v : fallback;
++
++        return new AutoTuneSettings
++        {
++            PortamentoMs = (float)Read("portamento", 80),
++            PortamentoLeadMs = (float)Read("lead", 0),
++            ScoopCents = (float)Read("scoop", 50),
++            OvershootCents = (float)Read("overshoot", 0),
++            JitterCents = (float)Read("jitter", 6),
++            VibratoEnabled = _vibratoSwitch?.IsToggled ?? true,
++            VibratoLengthPct = (float)Read("vibLength", 35),
++            VibratoPeriodMs = (float)Read("vibPeriod", 175),
++            VibratoDepthCents = (float)Read("vibDepth", 25),
++            VibratoInPct = (float)Read("vibIn", 25),
++            VibratoOutPct = (float)Read("vibOut", 25),
++            VibratoShiftPct = (float)Read("vibShift", 0),
++            VibratoDriftPct = (float)Read("vibDrift", 0),
++            VibratoVolLinkPct = (float)Read("vibVolLink", 0),
++            ApplyExpressions = _expressionSwitch?.IsToggled ?? false,
++            DynPct = (float)Read("dyn", 50),
++            TensionPct = (float)Read("tenc", 50),
++            BreathPct = (float)Read("brec", 50),
++            GenderPct = (float)Read("genc", 50),
++            VoicingPct = (float)Read("voic", 50),
++            VelocityPct = (float)Read("vel", 50),
++        };
++    }
++
++    private async void OnApplyClicked(object? sender, EventArgs e)
++    {
++        if (_notes.Count == 0)
++        {
++            return;
++        }
++        var project = DocManager.Inst.Project;
++        if (project == null)
++        {
++            return;
++        }
++        try
++        {
++            var commands = AutoTuneEngine.BuildCommands(project, _part, _notes, BuildSettings());
++            if (commands.Count == 0)
++            {
++                await Toast.Make("没有可调音的音符", ToastDuration.Short).Show();
++                return;
++            }
++            DocManager.Inst.StartUndoGroup();
++            foreach (var command in commands)
++            {
++                DocManager.Inst.ExecuteCmd(command);
++            }
++            DocManager.Inst.EndUndoGroup();
++            await Toast.Make($"已调音 {_notes.Count} 个音符", ToastDuration.Short).Show();
++            await Navigation.PopModalAsync();
++        }
++        catch (Exception ex)
++        {
++            Log.Error(ex, "自动调音失败");
++            await DisplayAlert("调音失败", ex.Message, "好");
++        }
++    }
++
++    private async void OnClearClicked(object? sender, EventArgs e)
++    {
++        if (_notes.Count == 0)
++        {
++            return;
++        }
++        try
++        {
++            var commands = AutoTuneEngine.BuildClearCommands(_part, _notes);
++            if (commands.Count == 0)
++            {
++                return;
++            }
++            DocManager.Inst.StartUndoGroup();
++            foreach (var command in commands)
++            {
++                DocManager.Inst.ExecuteCmd(command);
++            }
++            DocManager.Inst.EndUndoGroup();
++            await Toast.Make("已清除音高与颤音", ToastDuration.Short).Show();
++            await Navigation.PopModalAsync();
++        }
++        catch (Exception ex)
++        {
++            Log.Error(ex, "清除音高失败");
++            await DisplayAlert("清除失败", ex.Message, "好");
++        }
++    }
++
++    #endregion
++
++    private string BuildSummaryText()
++    {
++        int singable = _notes.Count(n => !AutoTuneEngine.IsRest(n));
++        return _notes.Count == 0
++            ? "当前分片没有可调音的音符"
++            : $"作用范围：{_notes.Count} 个音符（其中 {singable} 个可发音），未选中时默认整个分片";
++    }
++
++    private static string Format(double value, string unit, int decimals)
++    {
++        string number = decimals > 0 ? value.ToString("F" + decimals) : Math.Round(value).ToString("F0");
++        return string.IsNullOrEmpty(unit) ? number : $"{number} {unit}";
++    }
++}
+diff --git a/OpenUtauMobile/Views/EditPage.xaml b/OpenUtauMobile/Views/EditPage.xaml
+index 563fd3f..81e41a8 100644
+--- a/OpenUtauMobile/Views/EditPage.xaml
++++ b/OpenUtauMobile/Views/EditPage.xaml
+@@ -354,6 +354,9 @@
+                             <Grid RowDefinitions="40" IsVisible="{Binding IsShowRenderPitchButton}">
+                                 <Button Text="AI" x:Name="ButtonRenderPitch" Style="{StaticResource CircularToolbarButtonStyle}" Clicked="ButtonRenderPitch_Clicked"/>
+                             </Grid>
++                            <Grid RowDefinitions="40">
++                                <Button Text="调音" x:Name="ButtonAutoTune" Style="{StaticResource CircularToolbarButtonStyle}" Clicked="ButtonAutoTune_Clicked"/>
++                            </Grid>
+                             <Grid RowDefinitions="40">
+                                 <Button ImageSource="{DynamicResource magnet}" x:Name="ButtonPianoRollSnapToGrid" Style="{StaticResource CircularToolbarButtonStyle}" Clicked="ButtonPianoRollSnapToGrid_Clicked">
+                                     <Button.Behaviors>
+diff --git a/OpenUtauMobile/Views/EditPage.xaml.cs b/OpenUtauMobile/Views/EditPage.xaml.cs
+index 107737b..7d1e43a 100644
+--- a/OpenUtauMobile/Views/EditPage.xaml.cs
++++ b/OpenUtauMobile/Views/EditPage.xaml.cs
+@@ -2816,6 +2816,25 @@ public partial class EditPage : ContentPage, ICmdSubscriber, IDisposable
+         }
+     }
+ 
++    /// <summary>
++    /// 打开调音面板：对选中的音符（没有选中则对整个分片）生成自动音高、颤音和表情。
++    /// </summary>
++    private async void ButtonAutoTune_Clicked(object sender, EventArgs e)
++    {
++        if (_viewModel.EditingPart is not UVoicePart part)
++        {
++            return;
++        }
++        List<UNote> notes = _viewModel.SelectedNotes.Count > 0
++            ? _viewModel.SelectedNotes.ToList()
++            : part.notes.ToList();
++        if (notes.Count == 0)
++        {
++            return;
++        }
++        await Navigation.PushModalAsync(new AutoTunePage(part, notes));
++    }
++
+     public void UpdateRenderProgress(string workId, int renderedPhrases, int totalPhrases)
+     {
+         MainThread.BeginInvokeOnMainThread(() =>
