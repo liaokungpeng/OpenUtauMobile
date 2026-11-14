@@ -1,0 +1,97 @@
+name: Build Android APK (AutoTune)
+
+# 手机上的用法（不用电脑）：
+# 1. fork 这个仓库到你的账号
+# 2. 用「Create new file」在本文件路径新建，把内容贴进去，提交
+# 3. 用「Upload files」把 autotune.patch 传到仓库根目录
+# 4. Actions 页面启用工作流 → 选这个 → Run workflow
+# 5. 跑完到 Releases 页直接下载 APK（不用解压）
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "构建配置（Debug 快、Release 流畅但久）"
+        required: true
+        default: "Debug"
+        type: choice
+        options:
+          - Debug
+          - Release
+      rid:
+        description: "目标架构（现在手机几乎都是 arm64）"
+        required: true
+        default: "android-arm64"
+        type: choice
+        options:
+          - android-arm64
+          - android-arm
+          - android-x64
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply AutoTune patch
+        run: |
+          set -e
+          if git apply --reverse --check autotune.patch 2>/dev/null; then
+            echo "补丁已经应用过，跳过"
+          else
+            git apply autotune.patch
+            echo "补丁应用成功"
+          fi
+          git --no-pager diff --stat
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install MAUI Android workload
+        run: |
+          dotnet workload install maui-android || sudo dotnet workload install maui-android
+          dotnet workload list
+
+      - name: Publish APK
+        env:
+          CONFIG: ${{ inputs.configuration }}
+          RID: ${{ inputs.rid }}
+        run: |
+          set -e
+          dotnet publish OpenUtauMobile/OpenUtauMobile.csproj \
+            -c "$CONFIG" \
+            -f net9.0-android \
+            -r "$RID" \
+            -p:AndroidPackageFormat=apk \
+            -p:AndroidKeyStore=false \
+            -p:JavaMaximumHeapSize=4G
+          echo "== 产物 =="
+          find OpenUtauMobile/bin/"$CONFIG"/net9.0-android -name '*.apk' -exec ls -lh {} \;
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.configuration }}-${{ inputs.rid }}
+          path: OpenUtauMobile/bin/${{ inputs.configuration }}/net9.0-android/**/publish/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attach APK to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: autotune-${{ inputs.configuration }}-${{ github.run_number }}
+          name: AutoTune ${{ inputs.configuration }} build #${{ github.run_number }}
+          body: |
+            补丁版 OpenUtau Mobile（自动调音）。
+            装之前先卸载原版，否则会提示「应用未安装」。
+            架构：${{ inputs.rid }}
+          files: OpenUtauMobile/bin/${{ inputs.configuration }}/net9.0-android/**/publish/*.apk
