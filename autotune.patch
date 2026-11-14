@@ -626,10 +626,10 @@ index 0000000..19c341e
 +}
 diff --git a/OpenUtauMobile/Views/AutoTunePage.cs b/OpenUtauMobile/Views/AutoTunePage.cs
 new file mode 100644
-index 0000000..740c0aa
+index 0000000..a69fa1c
 --- /dev/null
 +++ b/OpenUtauMobile/Views/AutoTunePage.cs
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,646 @@
 +using CommunityToolkit.Maui.Alerts;
 +using CommunityToolkit.Maui.Core;
 +using OpenUtau.Core;
@@ -1169,23 +1169,29 @@ index 0000000..740c0aa
 +                await Toast.Make("没有可调音的音符", ToastDuration.Short).Show();
 +                return;
 +            }
-+            DocManager.Inst.StartUndoGroup();
-+            foreach (var command in commands)
++            DocManager.Inst.StartUndoGroup(deferValidate: true);
++            try
 +            {
-+                DocManager.Inst.ExecuteCmd(command);
++                foreach (var command in commands)
++                {
++                    DocManager.Inst.ExecuteCmd(command);
++                }
++                DocManager.Inst.EndUndoGroup();
 +            }
-+            DocManager.Inst.EndUndoGroup();
-+            WriteApplyLog(settings, commands.Count);
++            catch
++            {
++                // 中途失败要回滚并关掉撤销组，否则后续每次都会报 undoGroup already started。
++                DocManager.Inst.RollBackUndoGroup();
++                throw;
++            }
 +            string summary =
-+                $"滑音 {settings.PortamentoMs:F0}ms · 起音 {settings.ScoopCents:F0} 音分\n" +
-+                (settings.VibratoEnabled
-+                    ? $"颤音 深度 {settings.VibratoDepthCents:F0} 音分 / 周期 {settings.VibratoPeriodMs:F0}ms\n"
-+                    : "颤音 关闭\n") +
-+                (settings.ApplyExpressions
-+                    ? $"表情 dyn {settings.DynPct:F0} / genc {settings.GenderPct:F0} / brec {settings.BreathPct:F0}"
-+                    : "表情 未写入（总开关关闭）");
-+            Log.Information("AutoTune apply: " + summary.Replace("\n", " | "));
-+            await DisplayAlert($"已写入 {_notes.Count} 个音符", summary, "好");
++                $"滑音{settings.PortamentoMs:F0}ms 颤音{(settings.VibratoEnabled ? settings.VibratoDepthCents.ToString("F0") : "关")}" +
++                (settings.ApplyExpressions ? $" 表情dyn{settings.DynPct:F0}/genc{settings.GenderPct:F0}" : " 未写表情");
++            Log.Information("AutoTune apply: " + summary);
++            // 写日志放到后台，避免存储权限不对时卡住界面。
++            string logLine = summary + $" notes={_notes.Count} commands={commands.Count}";
++            _ = Task.Run(() => WriteApplyLog(logLine));
++            await Toast.Make($"已调音 {_notes.Count} 个音符 · {summary}", ToastDuration.Long).Show();
 +            await Navigation.PopModalAsync();
 +        }
 +        catch (Exception ex)
@@ -1198,27 +1204,22 @@ index 0000000..740c0aa
 +    /// <summary>
 +    /// 把这次实际用到的参数写到手机存储，方便排查「调了却没变化」。
 +    /// </summary>
-+    private void WriteApplyLog(AutoTuneSettings settings, int commandCount)
++    private void WriteApplyLog(string line)
 +    {
-+        try
++        foreach (string dir in new[] { "/sdcard/Download/DSH-Go", "/sdcard/Download", "/sdcard" })
 +        {
-+            string dir = "/sdcard/Download/DSH-Go";
-+            Directory.CreateDirectory(dir);
-+            var sb = new System.Text.StringBuilder();
-+            sb.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] notes={_notes.Count} commands={commandCount} preset={_presetPicker?.SelectedIndex ?? -1} lastPreset={_lastPresetIndex}");
-+            sb.AppendLine($"  portamento={settings.PortamentoMs} lead={settings.PortamentoLeadMs} scoop={settings.ScoopCents} overshoot={settings.OvershootCents} jitter={settings.JitterCents}");
-+            sb.AppendLine($"  vibrato={settings.VibratoEnabled} len={settings.VibratoLengthPct} period={settings.VibratoPeriodMs} depth={settings.VibratoDepthCents} in={settings.VibratoInPct} out={settings.VibratoOutPct}");
-+            sb.AppendLine($"  expr={settings.ApplyExpressions} dyn={settings.DynPct} tenc={settings.TensionPct} brec={settings.BreathPct} genc={settings.GenderPct} voic={settings.VoicingPct} vel={settings.VelocityPct}");
-+            var first = _notes.FirstOrDefault(n => !AutoTuneEngine.IsRest(n));
-+            if (first != null)
++            try
 +            {
-+                sb.AppendLine($"  note0 pitchPoints={first.pitch.data.Count} phonemeExprs={first.phonemeExpressions.Count} vibLen={first.vibrato.length}");
++                Directory.CreateDirectory(dir);
++                File.AppendAllText(
++                    Path.Combine(dir, "autotune-log.txt"),
++                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {line}{Environment.NewLine}");
++                return;
 +            }
-+            File.AppendAllText(Path.Combine(dir, "autotune-log.txt"), sb.ToString());
-+        }
-+        catch (Exception ex)
-+        {
-+            Log.Warning("写入调音日志失败：{Message}", ex.Message);
++            catch (Exception ex)
++            {
++                Log.Warning("写入调音日志失败 {Dir}：{Message}", dir, ex.Message);
++            }
 +        }
 +    }
 +
@@ -1235,12 +1236,20 @@ index 0000000..740c0aa
 +            {
 +                return;
 +            }
-+            DocManager.Inst.StartUndoGroup();
-+            foreach (var command in commands)
++            DocManager.Inst.StartUndoGroup(deferValidate: true);
++            try
 +            {
-+                DocManager.Inst.ExecuteCmd(command);
++                foreach (var command in commands)
++                {
++                    DocManager.Inst.ExecuteCmd(command);
++                }
++                DocManager.Inst.EndUndoGroup();
 +            }
-+            DocManager.Inst.EndUndoGroup();
++            catch
++            {
++                DocManager.Inst.RollBackUndoGroup();
++                throw;
++            }
 +            await Toast.Make("已清除音高与颤音", ToastDuration.Short).Show();
 +            await Navigation.PopModalAsync();
 +        }
