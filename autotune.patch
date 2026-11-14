@@ -1,9 +1,9 @@
 diff --git a/OpenUtauMobile/Utils/AutoTune/AutoTuneEngine.cs b/OpenUtauMobile/Utils/AutoTune/AutoTuneEngine.cs
 new file mode 100644
-index 0000000..b90aa66
+index 0000000..015efd4
 --- /dev/null
 +++ b/OpenUtauMobile/Utils/AutoTune/AutoTuneEngine.cs
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,415 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Linq;
@@ -57,20 +57,14 @@ index 0000000..b90aa66
 +        /// <summary>短于该时长（毫秒）的音符不写颤音。</summary>
 +        public float VibratoMinNoteMs = 300f;
 +
-+        /// <summary>是否同时把表情值写到音符上。</summary>
++        /// <summary>是否同时写入表情。</summary>
 +        public bool ApplyExpressions = false;
-+        /// <summary>力度（dyn）百分比，0~100 映射到表情描述符的 min~max。</summary>
-+        public float DynPct = 50f;
-+        /// <summary>张力（tenc）百分比。</summary>
-+        public float TensionPct = 50f;
-+        /// <summary>气声（brec）百分比。</summary>
-+        public float BreathPct = 50f;
-+        /// <summary>性别（genc）百分比。</summary>
-+        public float GenderPct = 50f;
-+        /// <summary>声线（voic）百分比。</summary>
-+        public float VoicingPct = 50f;
-+        /// <summary>力度参数（vel）百分比。</summary>
-+        public float VelocityPct = 50f;
++        /// <summary>
++        /// 表情缩写 -> 百分比（0~100，50 等于该表情的默认值）。
++        /// 曲线类表情（genc / dyn / brec …）写进对应表情车道，数值类写到音符上。
++        /// 面板按工程里注册的表情动态填充，这里不做固定字段。
++        /// </summary>
++        public Dictionary<string, double> Expressions = new();
 +    }
 +
 +    /// <summary>
@@ -114,29 +108,46 @@ index 0000000..b90aa66
 +                commands.Add(new SetVibratoCommand(part, note, BuildVibrato(note, settings)));
 +            }
 +
-+            if (settings.ApplyExpressions)
++            if (settings.ApplyExpressions && settings.Expressions.Count > 0)
 +            {
 +                var track = part.trackNo >= 0 && part.trackNo < project.tracks.Count
 +                    ? project.tracks[part.trackNo]
 +                    : null;
 +                if (track != null)
 +                {
-+                    foreach (var item in new[] {
-+                        (UstxConst.DYN, settings.DynPct),
-+                        (UstxConst.TENC, settings.TensionPct),
-+                        (UstxConst.BREC, settings.BreathPct),
-+                        (UstxConst.GENC, settings.GenderPct),
-+                        (UstxConst.VOIC, settings.VoicingPct),
-+                        (UstxConst.VEL, settings.VelocityPct),
-+                    })
++                    foreach (var item in settings.Expressions)
 +                    {
-+                        if (!project.expressions.TryGetValue(item.Item1, out var descriptor))
++                        if (!project.expressions.TryGetValue(item.Key, out var descriptor))
 +                        {
 +                            continue;
 +                        }
-+                        float value = descriptor.min + (descriptor.max - descriptor.min) * Clamp(item.Item2, 0f, 100f) / 100f;
-+                        commands.Add(new SetNotesSameExpressionCommand(
-+                            project, track, part, targets, item.Item1, value));
++                        if (descriptor.type == UExpressionType.Options)
++                        {
++                            continue;
++                        }
++                        float pct = Clamp((float)item.Value, 0f, 100f);
++                        if (descriptor.type == UExpressionType.Curve)
++                        {
++                            // 曲线类表情（genc / dyn / brec…）在钢琴卷帘里是「轨道曲线」，
++                            // 写音符级数值那条线不会动，必须写曲线。
++                            float span = (descriptor.max - descriptor.min) / 2f;
++                            float curveValue = descriptor.defaultValue + (pct - 50f) / 50f * span;
++                            curveValue = Math.Clamp(curveValue, descriptor.min, descriptor.max);
++                            int startTick = targets.Min(n => n.position);
++                            int endTick = targets.Max(n => n.position + n.duration);
++                            if (endTick > startTick)
++                            {
++                                commands.Add(new SetCurveConstantCommand(
++                                    part, descriptor, startTick, endTick,
++                                    (int)Math.Round(curveValue)));
++                            }
++                        }
++                        else
++                        {
++                            float value = descriptor.min + (descriptor.max - descriptor.min) * pct / 100f;
++                            commands.Add(new SetNotesSameExpressionCommand(
++                                project, track, part, targets, item.Key, value));
++                        }
 +                    }
 +                }
 +            }
@@ -313,12 +324,107 @@ index 0000000..b90aa66
 +        }
 +    }
 +}
++
++namespace OpenUtauMobile.Utils.AutoTune
++{
++    /// <summary>
++    /// 把一条轨道表情曲线在 [startTick, endTick] 内设成常量。
++    /// 曲线类表情（genc / dyn / brec / voic…）只能这样写，写音符级数值不会让那条线动。
++    /// </summary>
++    public sealed class SetCurveConstantCommand : OpenUtau.Core.UCommand
++    {
++        readonly UVoicePart part;
++        readonly UExpressionDescriptor descriptor;
++        readonly int startTick;
++        readonly int endTick;
++        readonly int value;
++        UCurve? curve;
++        bool created;
++        List<int>? oldXs;
++        List<int>? oldYs;
++
++        public override OpenUtau.Core.ValidateOptions ValidateOptions => new OpenUtau.Core.ValidateOptions
++        {
++            SkipTiming = true,
++            Part = part,
++            SkipPhonemizer = true,
++            SkipPhoneme = true,
++        };
++
++        public SetCurveConstantCommand(UVoicePart part, UExpressionDescriptor descriptor, int startTick, int endTick, int value)
++        {
++            this.part = part;
++            this.descriptor = descriptor;
++            this.startTick = Math.Min(startTick, endTick);
++            this.endTick = Math.Max(startTick, endTick);
++            this.value = (int)Math.Clamp(value, descriptor.min, descriptor.max);
++        }
++
++        public override void Execute()
++        {
++            curve = part.curves.FirstOrDefault(c => c.abbr == descriptor.abbr);
++            if (curve == null)
++            {
++                curve = new UCurve(descriptor);
++                part.curves.Add(curve);
++                created = true;
++            }
++            oldXs = curve.xs.ToList();
++            oldYs = curve.ys.ToList();
++
++            var xs = new List<int>();
++            var ys = new List<int>();
++            for (int i = 0; i < oldXs.Count; i++)
++            {
++                if (oldXs[i] < startTick || oldXs[i] > endTick)
++                {
++                    xs.Add(oldXs[i]);
++                    ys.Add(oldYs[i]);
++                }
++            }
++            Insert(xs, ys, startTick, value);
++            Insert(xs, ys, endTick, value);
++            curve.xs = xs;
++            curve.ys = ys;
++        }
++
++        public override void Unexecute()
++        {
++            if (curve == null)
++            {
++                return;
++            }
++            if (created)
++            {
++                part.curves.Remove(curve);
++                return;
++            }
++            curve.xs = oldXs!.ToList();
++            curve.ys = oldYs!.ToList();
++        }
++
++        static void Insert(List<int> xs, List<int> ys, int x, int y)
++        {
++            int idx = xs.BinarySearch(x);
++            if (idx >= 0)
++            {
++                ys[idx] = y;
++                return;
++            }
++            idx = ~idx;
++            xs.Insert(idx, x);
++            ys.Insert(idx, y);
++        }
++
++        public override string ToString() => $"Set curve {descriptor.abbr}";
++    }
++}
 diff --git a/OpenUtauMobile/Utils/AutoTune/AutoTunePresetStore.cs b/OpenUtauMobile/Utils/AutoTune/AutoTunePresetStore.cs
 new file mode 100644
-index 0000000..19c341e
+index 0000000..2e2f5db
 --- /dev/null
 +++ b/OpenUtauMobile/Utils/AutoTune/AutoTunePresetStore.cs
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,321 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Globalization;
@@ -340,8 +446,10 @@ index 0000000..19c341e
 +        /// <summary>来源包名，用于重名时区分。</summary>
 +        public string Source { get; init; } = string.Empty;
 +        public Dictionary<string, double> Values { get; init; } = new();
++        /// <summary>表情缩写 -> 百分比（0~100）。</summary>
++        public Dictionary<string, double> ExpressionValues { get; init; } = new();
 +        public bool? Vibrato { get; init; }
-+        public bool? Expressions { get; init; }
++        public bool? ExpressionsEnabled { get; init; }
 +    }
 +
 +    /// <summary>
@@ -358,7 +466,6 @@ index 0000000..19c341e
 +            "portamento", "lead", "scoop", "overshoot", "jitter",
 +            "vibLength", "vibPeriod", "vibDepth", "vibIn", "vibOut",
 +            "vibShift", "vibDrift", "vibVolLink",
-+            "dyn", "tenc", "brec", "genc", "voic", "vel",
 +        };
 +
 +        private static readonly Dictionary<string, string> KeyMap = BuildKeyMap();
@@ -490,6 +597,7 @@ index 0000000..19c341e
 +        {
 +            string name = string.Empty;
 +            var values = new Dictionary<string, double>();
++            var expressionValues = new Dictionary<string, double>();
 +            bool? vibrato = null;
 +            bool? expressions = null;
 +
@@ -513,14 +621,23 @@ index 0000000..19c341e
 +                        expressions = ToBool(pair.Value) ?? expressions;
 +                        continue;
 +                }
-+                if (!KeyMap.TryGetValue(key, out var sliderKey))
++                double? parsed = ToDouble(pair.Value);
++                if (!parsed.HasValue)
 +                {
 +                    continue;
 +                }
-+                double? value = ToDouble(pair.Value);
-+                if (value.HasValue)
++                if (KeyMap.TryGetValue(key, out var sliderKey))
 +                {
-+                    values[sliderKey] = value.Value;
++                    values[sliderKey] = parsed.Value;
++                }
++                else if (!string.IsNullOrEmpty(key))
++                {
++                    // 认不出来就当表情缩写（genc / dyn / tenc …），
++                    // 应用时再按工程里真正注册的表情校验，写错也不会出错。
++                    string abbr = ExpressionAliases.TryGetValue(key, out var alias)
++                        ? alias
++                        : pair.Key.Trim().ToLowerInvariant();
++                    expressionValues[abbr] = parsed.Value;
 +                }
 +            }
 +
@@ -533,8 +650,9 @@ index 0000000..19c341e
 +                Name = name,
 +                Source = source,
 +                Values = values,
++                ExpressionValues = expressionValues,
 +                Vibrato = vibrato,
-+                Expressions = expressions,
++                ExpressionsEnabled = expressions,
 +            };
 +        }
 +
@@ -606,17 +724,21 @@ index 0000000..19c341e
 +                    map[normalized] = key;
 +                }
 +            }
-+            // 常见别名，方便手写预设
-+            map["tension"] = "tenc";
-+            map["breath"] = "brec";
-+            map["breathiness"] = "brec";
-+            map["gender"] = "genc";
-+            map["voicing"] = "voic";
-+            map["velocity"] = "vel";
-+            map["dynamics"] = "dyn";
-+            map["volume"] = "dyn";
 +            return map;
 +        }
++
++        /// <summary>表情的常见写法 -> 缩写。</summary>
++        private static readonly Dictionary<string, string> ExpressionAliases = new()
++        {
++            ["tension"] = "tenc",
++            ["breath"] = "brec",
++            ["breathiness"] = "brec",
++            ["gender"] = "genc",
++            ["voicing"] = "voic",
++            ["velocity"] = "vel",
++            ["dynamics"] = "dyn",
++            ["volume"] = "dyn",
++        };
 +
 +        private sealed class PresetFile
 +        {
@@ -626,10 +748,10 @@ index 0000000..19c341e
 +}
 diff --git a/OpenUtauMobile/Views/AutoTunePage.cs b/OpenUtauMobile/Views/AutoTunePage.cs
 new file mode 100644
-index 0000000..a69fa1c
+index 0000000..bec4e56
 --- /dev/null
 +++ b/OpenUtauMobile/Views/AutoTunePage.cs
-@@ -0,0 +1,646 @@
+@@ -0,0 +1,743 @@
 +using CommunityToolkit.Maui.Alerts;
 +using CommunityToolkit.Maui.Core;
 +using OpenUtau.Core;
@@ -663,18 +785,26 @@ index 0000000..a69fa1c
 +    private readonly Dictionary<string, double> _defaults = new();
 +    private List<AutoTunePreset> _customPresets = new();
 +    private List<string> _presetNames = new();
++    private readonly List<UExpressionDescriptor> _expressionDescriptors = new();
 +    private int _lastPresetIndex = -1;
 +    private bool _syncing;
 +
 +    private static readonly string[] PresetNames = {
 +        "自然（推荐）", "标准", "强颤音", "电音 Auto-Tune", "古风柔滑", "朗读",
++        "明亮少女", "低沉大叔", "气声耳语", "摇滚爆发",
 +    };
 +
-+    public AutoTunePage(UVoicePart part, List<UNote> notes)
++    public AutoTunePage(UVoicePart part, List<UNote> notes, IReadOnlyList<UExpressionDescriptor>? expressions = null)
 +    {
 +        _part = part;
 +        _notes = notes ?? new List<UNote>();
 +        Title = "调音";
++        _expressionDescriptors = (expressions
++                ?? DocManager.Inst.Project?.expressions.Values.ToList()
++                ?? new List<UExpressionDescriptor>())
++            .Where(d => d != null && d.type != UExpressionType.Options)
++            .OrderBy(d => d.name)
++            .ToList();
 +        _customPresets = LoadCustomPresets();
 +        _presetNames = BuildPresetNames();
 +
@@ -808,19 +938,26 @@ index 0000000..a69fa1c
 +        stack.Children.Add(SectionTitle("表情（可选批量写入）"));
 +        _expressionSwitch = new Switch { IsToggled = false, HorizontalOptions = LayoutOptions.Start };
 +        stack.Children.Add(SwitchRow("同时写入表情", _expressionSwitch, "50% 等于表情的默认值"));
-+        AddSlider(stack, "dyn", "力度 dyn", 0, 100, 50, "%");
-+        AddSlider(stack, "tenc", "张力 tenc", 0, 100, 50, "%");
-+        AddSlider(stack, "brec", "气声 brec", 0, 100, 50, "%");
-+        AddSlider(stack, "genc", "性别 genc", 0, 100, 50, "%");
-+        AddSlider(stack, "voic", "声线 voic", 0, 100, 50, "%");
-+        AddSlider(stack, "vel", "力度 vel", 0, 100, 50, "%");
++        foreach (var descriptor in _expressionDescriptors)
++        {
++            AddSlider(stack, ExpressionKey(descriptor.abbr), $"{descriptor.name}  {descriptor.abbr}", 0, 100, 50, "%");
++        }
++        if (_expressionDescriptors.Count == 0)
++        {
++            stack.Children.Add(new Label
++            {
++                FontSize = 11,
++                TextColor = Colors.Gray,
++                Text = "这个工程没有可写的表情",
++            });
++        }
 +
 +        stack.Children.Add(new Label
 +        {
 +            FontSize = 11,
 +            TextColor = Colors.Gray,
 +            Margin = new Thickness(0, 10, 0, 0),
-+            Text = "生成结果是工程里真实的音高锚点与颤音参数，撤销、保存、导回桌面版都不受影响。",
++            Text = "生成结果是工程里真实的音高锚点与颤音参数，撤销、保存、导回桌面版都不受影响。\n表情里的 genc / dyn / brec 是曲线，会直接写进对应表情车道（覆盖所选范围）。",
 +        });
 +
 +        return new ScrollView { Content = stack };
@@ -978,31 +1115,61 @@ index 0000000..a69fa1c
 +        _syncing = true;
 +        try
 +        {
++            ResetExpressions();
 +            switch (index)
 +            {
 +                case 1: // 标准：接近桌面版默认 Portamento/Vibrato 预设
 +                    SetValues(("portamento", 80), ("lead", 40), ("scoop", 40), ("overshoot", 10), ("jitter", 4),
 +                        ("vibLength", 40), ("vibPeriod", 175), ("vibDepth", 30), ("vibIn", 20), ("vibOut", 20));
 +                    SetVibrato(true);
++                    SetExpressions(("dyn", 55), ("tenc", 55), ("vel", 55));
 +                    break;
 +                case 2: // 强颤音
 +                    SetValues(("portamento", 70), ("lead", 30), ("scoop", 30), ("overshoot", 0), ("jitter", 3),
 +                        ("vibLength", 55), ("vibPeriod", 190), ("vibDepth", 55), ("vibIn", 25), ("vibOut", 25));
 +                    SetVibrato(true);
++                    SetExpressions(("tenc", 60), ("dyn", 55));
 +                    break;
 +                case 3: // 电音：几乎不滑音、不颤音，音头干净
 +                    SetValues(("portamento", 12), ("lead", 0), ("scoop", 0), ("overshoot", 0), ("jitter", 0),
 +                        ("vibLength", 10), ("vibPeriod", 160), ("vibDepth", 8), ("vibIn", 50), ("vibOut", 50));
 +                    SetVibrato(true);
++                    SetExpressions(("dyn", 70), ("tenc", 65), ("brec", 25));
 +                    break;
 +                case 4: // 古风柔滑：长滑音 + 慢颤音
 +                    SetValues(("portamento", 150), ("lead", 80), ("scoop", 90), ("overshoot", 0), ("jitter", 8),
 +                        ("vibLength", 60), ("vibPeriod", 210), ("vibDepth", 30), ("vibIn", 35), ("vibOut", 40));
 +                    SetVibrato(true);
++                    SetExpressions(("dyn", 45), ("brec", 45), ("genc", 55));
 +                    break;
 +                case 5: // 朗读：轻滑音，不颤
 +                    SetValues(("portamento", 30), ("lead", 0), ("scoop", 20), ("overshoot", 0), ("jitter", 5));
 +                    SetVibrato(false);
++                    SetExpressions(("dyn", 60), ("vel", 70));
++                    break;
++                case 6: // 明亮少女
++                    SetValues(("portamento", 90), ("lead", 20), ("scoop", 60), ("overshoot", 10), ("jitter", 4),
++                        ("vibLength", 35), ("vibPeriod", 165), ("vibDepth", 28), ("vibIn", 25), ("vibOut", 25));
++                    SetVibrato(true);
++                    SetExpressions(("genc", 70), ("dyn", 60));
++                    break;
++                case 7: // 低沉大叔
++                    SetValues(("portamento", 120), ("lead", 40), ("scoop", 80), ("overshoot", 5), ("jitter", 6),
++                        ("vibLength", 55), ("vibPeriod", 200), ("vibDepth", 32), ("vibIn", 30), ("vibOut", 35));
++                    SetVibrato(true);
++                    SetExpressions(("genc", 25), ("dyn", 65), ("tenc", 45));
++                    break;
++                case 8: // 气声耳语
++                    SetValues(("portamento", 60), ("lead", 0), ("scoop", 30), ("overshoot", 0), ("jitter", 8),
++                        ("vibLength", 25), ("vibPeriod", 210), ("vibDepth", 12), ("vibIn", 40), ("vibOut", 45));
++                    SetVibrato(true);
++                    SetExpressions(("brec", 85), ("dyn", 40));
++                    break;
++                case 9: // 摇滚爆发
++                    SetValues(("portamento", 70), ("lead", 25), ("scoop", 40), ("overshoot", 20), ("jitter", 9),
++                        ("vibLength", 60), ("vibPeriod", 150), ("vibDepth", 45), ("vibIn", 15), ("vibOut", 20));
++                    SetVibrato(true);
++                    SetExpressions(("dyn", 85), ("tenc", 80));
 +                    break;
 +                default: // 自然
 +                    SetValues(("portamento", 80), ("lead", 0), ("scoop", 50), ("overshoot", 0), ("jitter", 6),
@@ -1041,10 +1208,19 @@ index 0000000..a69fa1c
 +                    label.Text = Format(value, _units[key], _decimals[key]);
 +                }
 +            }
-+            SetVibrato(preset.Vibrato ?? true);
-+            if (preset.Expressions.HasValue && _expressionSwitch != null)
++            if (preset.ExpressionValues.Count > 0)
 +            {
-+                _expressionSwitch.IsToggled = preset.Expressions.Value;
++                SetExpressions(preset.ExpressionValues.Select(kv => (kv.Key, kv.Value)).ToArray());
++                // 预设带表情就自动打开总开关，避免「选了预设但表情没写」。
++                if (_expressionSwitch != null)
++                {
++                    _expressionSwitch.IsToggled = true;
++                }
++            }
++            SetVibrato(preset.Vibrato ?? true);
++            if (preset.ExpressionsEnabled.HasValue && _expressionSwitch != null)
++            {
++                _expressionSwitch.IsToggled = preset.ExpressionsEnabled.Value;
 +            }
 +        }
 +        finally
@@ -1085,6 +1261,52 @@ index 0000000..a69fa1c
 +            names.Add(candidate);
 +        }
 +        return names;
++    }
++
++    private static string ExpressionKey(string abbr) => "exp:" + abbr;
++
++    /// <summary>收集当前面板上的表情百分比（开关关闭时为空）。</summary>
++    private Dictionary<string, double> BuildExpressionValues()
++    {
++        var values = new Dictionary<string, double>();
++        if (_expressionSwitch?.IsToggled != true)
++        {
++            return values;
++        }
++        foreach (var descriptor in _expressionDescriptors)
++        {
++            if (_values.TryGetValue(ExpressionKey(descriptor.abbr), out double pct))
++            {
++                values[descriptor.abbr] = pct;
++            }
++        }
++        return values;
++    }
++
++    /// <summary>把表情滑杆全部复位到默认值（50%）。</summary>
++    private void ResetExpressions()
++    {
++        foreach (var descriptor in _expressionDescriptors)
++        {
++            string key = ExpressionKey(descriptor.abbr);
++            if (_defaults.TryGetValue(key, out double fallback))
++            {
++                SetValues((key, fallback));
++            }
++        }
++    }
++
++    private void SetExpressions(params (string Abbr, double Pct)[] pairs)
++    {
++        foreach (var pair in pairs)
++        {
++            string key = ExpressionKey(pair.Abbr);
++            if (!_values.ContainsKey(key))
++            {
++                continue;
++            }
++            SetValues((key, pair.Pct));
++        }
 +    }
 +
 +    private void SetValues(params (string Key, double Value)[] pairs)
@@ -1140,12 +1362,7 @@ index 0000000..a69fa1c
 +            VibratoDriftPct = (float)Read("vibDrift", 0),
 +            VibratoVolLinkPct = (float)Read("vibVolLink", 0),
 +            ApplyExpressions = _expressionSwitch?.IsToggled ?? false,
-+            DynPct = (float)Read("dyn", 50),
-+            TensionPct = (float)Read("tenc", 50),
-+            BreathPct = (float)Read("brec", 50),
-+            GenderPct = (float)Read("genc", 50),
-+            VoicingPct = (float)Read("voic", 50),
-+            VelocityPct = (float)Read("vel", 50),
++            Expressions = BuildExpressionValues(),
 +        };
 +    }
 +
@@ -1186,7 +1403,9 @@ index 0000000..a69fa1c
 +            }
 +            string summary =
 +                $"滑音{settings.PortamentoMs:F0}ms 颤音{(settings.VibratoEnabled ? settings.VibratoDepthCents.ToString("F0") : "关")}" +
-+                (settings.ApplyExpressions ? $" 表情dyn{settings.DynPct:F0}/genc{settings.GenderPct:F0}" : " 未写表情");
++                (settings.ApplyExpressions && settings.Expressions.Count > 0
++                    ? $" 表情{settings.Expressions.Count}项"
++                    : " 未写表情");
 +            Log.Information("AutoTune apply: " + summary);
 +            // 写日志放到后台，避免存储权限不对时卡住界面。
 +            string logLine = summary + $" notes={_notes.Count} commands={commands.Count}";
