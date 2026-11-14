@@ -626,10 +626,10 @@ index 0000000..19c341e
 +}
 diff --git a/OpenUtauMobile/Views/AutoTunePage.cs b/OpenUtauMobile/Views/AutoTunePage.cs
 new file mode 100644
-index 0000000..1fcb40b
+index 0000000..740c0aa
 --- /dev/null
 +++ b/OpenUtauMobile/Views/AutoTunePage.cs
-@@ -0,0 +1,590 @@
+@@ -0,0 +1,637 @@
 +using CommunityToolkit.Maui.Alerts;
 +using CommunityToolkit.Maui.Core;
 +using OpenUtau.Core;
@@ -663,6 +663,7 @@ index 0000000..1fcb40b
 +    private readonly Dictionary<string, double> _defaults = new();
 +    private List<AutoTunePreset> _customPresets = new();
 +    private List<string> _presetNames = new();
++    private int _lastPresetIndex = -1;
 +    private bool _syncing;
 +
 +    private static readonly string[] PresetNames = {
@@ -762,11 +763,18 @@ index 0000000..1fcb40b
 +        };
 +        _presetPicker.SelectedIndexChanged += (s, e) =>
 +        {
-+            if (_syncing || _presetPicker.SelectedIndex < 0)
++            if (_syncing)
 +            {
 +                return;
 +            }
-+            ApplyPreset(_presetPicker.SelectedIndex);
++            int index = _presetPicker.SelectedIndex;
++            if (index < 0 || index == _lastPresetIndex)
++            {
++                // Android 上 Picker 会在拖动滑杆 / 页面重排时重复抛同一个索引，
++                // 这时再套一次预设会把刚调好的参数刷回去。
++                return;
++            }
++            ApplyPreset(index);
 +        };
 +        stack.Children.Add(_presetPicker);
 +        stack.Children.Add(new Label
@@ -957,6 +965,7 @@ index 0000000..1fcb40b
 +
 +    private void ApplyPreset(int index)
 +    {
++        _lastPresetIndex = index;
 +        if (index >= PresetNames.Length)
 +        {
 +            int customIndex = index - PresetNames.Length;
@@ -1153,7 +1162,8 @@ index 0000000..1fcb40b
 +        }
 +        try
 +        {
-+            var commands = AutoTuneEngine.BuildCommands(project, _part, _notes, BuildSettings());
++            var settings = BuildSettings();
++            var commands = AutoTuneEngine.BuildCommands(project, _part, _notes, settings);
 +            if (commands.Count == 0)
 +            {
 +                await Toast.Make("没有可调音的音符", ToastDuration.Short).Show();
@@ -1165,13 +1175,50 @@ index 0000000..1fcb40b
 +                DocManager.Inst.ExecuteCmd(command);
 +            }
 +            DocManager.Inst.EndUndoGroup();
-+            await Toast.Make($"已调音 {_notes.Count} 个音符", ToastDuration.Short).Show();
++            WriteApplyLog(settings, commands.Count);
++            string summary =
++                $"滑音 {settings.PortamentoMs:F0}ms · 起音 {settings.ScoopCents:F0} 音分\n" +
++                (settings.VibratoEnabled
++                    ? $"颤音 深度 {settings.VibratoDepthCents:F0} 音分 / 周期 {settings.VibratoPeriodMs:F0}ms\n"
++                    : "颤音 关闭\n") +
++                (settings.ApplyExpressions
++                    ? $"表情 dyn {settings.DynPct:F0} / genc {settings.GenderPct:F0} / brec {settings.BreathPct:F0}"
++                    : "表情 未写入（总开关关闭）");
++            Log.Information("AutoTune apply: " + summary.Replace("\n", " | "));
++            await DisplayAlert($"已写入 {_notes.Count} 个音符", summary, "好");
 +            await Navigation.PopModalAsync();
 +        }
 +        catch (Exception ex)
 +        {
 +            Log.Error(ex, "自动调音失败");
 +            await DisplayAlert("调音失败", ex.Message, "好");
++        }
++    }
++
++    /// <summary>
++    /// 把这次实际用到的参数写到手机存储，方便排查「调了却没变化」。
++    /// </summary>
++    private void WriteApplyLog(AutoTuneSettings settings, int commandCount)
++    {
++        try
++        {
++            string dir = "/sdcard/Download/DSH-Go";
++            Directory.CreateDirectory(dir);
++            var sb = new System.Text.StringBuilder();
++            sb.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] notes={_notes.Count} commands={commandCount} preset={_presetPicker?.SelectedIndex ?? -1} lastPreset={_lastPresetIndex}");
++            sb.AppendLine($"  portamento={settings.PortamentoMs} lead={settings.PortamentoLeadMs} scoop={settings.ScoopCents} overshoot={settings.OvershootCents} jitter={settings.JitterCents}");
++            sb.AppendLine($"  vibrato={settings.VibratoEnabled} len={settings.VibratoLengthPct} period={settings.VibratoPeriodMs} depth={settings.VibratoDepthCents} in={settings.VibratoInPct} out={settings.VibratoOutPct}");
++            sb.AppendLine($"  expr={settings.ApplyExpressions} dyn={settings.DynPct} tenc={settings.TensionPct} brec={settings.BreathPct} genc={settings.GenderPct} voic={settings.VoicingPct} vel={settings.VelocityPct}");
++            var first = _notes.FirstOrDefault(n => !AutoTuneEngine.IsRest(n));
++            if (first != null)
++            {
++                sb.AppendLine($"  note0 pitchPoints={first.pitch.data.Count} phonemeExprs={first.phonemeExpressions.Count} vibLen={first.vibrato.length}");
++            }
++            File.AppendAllText(Path.Combine(dir, "autotune-log.txt"), sb.ToString());
++        }
++        catch (Exception ex)
++        {
++            Log.Warning("写入调音日志失败：{Message}", ex.Message);
 +        }
 +    }
 +
