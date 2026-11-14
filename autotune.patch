@@ -748,10 +748,10 @@ index 0000000..2e2f5db
 +}
 diff --git a/OpenUtauMobile/Views/AutoTunePage.cs b/OpenUtauMobile/Views/AutoTunePage.cs
 new file mode 100644
-index 0000000..bec4e56
+index 0000000..ae93421
 --- /dev/null
 +++ b/OpenUtauMobile/Views/AutoTunePage.cs
-@@ -0,0 +1,743 @@
+@@ -0,0 +1,968 @@
 +using CommunityToolkit.Maui.Alerts;
 +using CommunityToolkit.Maui.Core;
 +using OpenUtau.Core;
@@ -771,15 +771,18 @@ index 0000000..bec4e56
 +{
 +    private readonly UVoicePart _part;
 +    private readonly List<UNote> _notes;
++    private readonly List<UNote> _selectedNotes;
 +    private readonly Dictionary<string, Slider> _sliders = new();
 +    private readonly Dictionary<string, double> _values = new();
 +    private readonly Dictionary<string, string> _units = new();
 +    private readonly Dictionary<string, int> _decimals = new();
 +    private readonly Dictionary<string, Label> _valueLabels = new();
 +
++    private Picker _scopePicker = null!;
 +    private Picker _presetPicker = null!;
 +    private Switch _vibratoSwitch = null!;
 +    private Switch _expressionSwitch = null!;
++    private Switch _logSwitch = null!;
 +    private Label _summaryLabel = null!;
 +    private Button _applyButton = null!;
 +    private readonly Dictionary<string, double> _defaults = new();
@@ -789,21 +792,61 @@ index 0000000..bec4e56
 +    private int _lastPresetIndex = -1;
 +    private bool _syncing;
 +
++    /// <summary>表情缩写 -> 中文名与一句话说明。</summary>
++    private static readonly Dictionary<string, (string Name, string Hint)> ExpressionInfo = new()
++    {
++        ["genc"] = ("性别", "向左更低沉、向右更明亮"),
++        ["dyn"] = ("力度", "越大越响，曲线作用于整段"),
++        ["brec"] = ("气声", "越大越沙哑、越透气"),
++        ["tenc"] = ("张力", "越大越紧、越有爆发力"),
++        ["voic"] = ("声线", "越大越清亮、越靠前"),
++        ["vel"] = ("力度（重音）", "越大咬字越重"),
++        ["vol"] = ("音量", "整体音量大小"),
++        ["atk"] = ("起音", "越小音头越软"),
++        ["dec"] = ("衰减", "尾音的衰减量"),
++        ["pitd"] = ("音高偏移", "单位音分，曲线形式"),
++        ["shft"] = ("移调（半音）", "整体升降调"),
++        ["shfc"] = ("移调（曲线）", "曲线形式的升降调"),
++        ["gen"] = ("性别（旗标）", "老式旗标写法，左低右高"),
++        ["bre"] = ("气声（旗标）", "老式旗标写法"),
++        ["lpf"] = ("低通滤波", "越小越闷、越远"),
++        ["norm"] = ("归一化", "越大越接近峰值音量"),
++        ["mod"] = ("调制", "颤音 / 音高调制的深度"),
++        ["mod+"] = ("调制+", "更强的调制"),
++        ["alt"] = ("替换发音", "换备用音素，需声库支持"),
++        ["clr"] = ("音色", "音色选项"),
++        ["eng"] = ("引擎", "选择合成引擎"),
++        ["dir"] = ("直接输出", "绕过重采样直接出声"),
++    };
++
++    /// <summary>常用表情排在前面，其余按字母排在后面。</summary>
++    private static readonly string[] ExpressionPriority = {
++        "genc", "dyn", "brec", "tenc", "voic", "vel", "vol", "atk", "dec", "pitd",
++        "shft", "shfc", "gen", "bre", "lpf", "norm", "mod", "mod+", "alt",
++    };
++
++    private const string LogPreferenceKey = "autotune.debuglog";
++
 +    private static readonly string[] PresetNames = {
 +        "自然（推荐）", "标准", "强颤音", "电音 Auto-Tune", "古风柔滑", "朗读",
 +        "明亮少女", "低沉大叔", "气声耳语", "摇滚爆发",
++        "怒音", "哭腔", "温柔", "低语旁白",
 +    };
 +
-+    public AutoTunePage(UVoicePart part, List<UNote> notes, IReadOnlyList<UExpressionDescriptor>? expressions = null)
++    public AutoTunePage(UVoicePart part, List<UNote> notes,
++        IReadOnlyList<UExpressionDescriptor>? expressions = null,
++        IReadOnlyList<UNote>? selectedNotes = null)
 +    {
 +        _part = part;
 +        _notes = notes ?? new List<UNote>();
++        _selectedNotes = selectedNotes?.ToList() ?? new List<UNote>();
 +        Title = "调音";
 +        _expressionDescriptors = (expressions
 +                ?? DocManager.Inst.Project?.expressions.Values.ToList()
 +                ?? new List<UExpressionDescriptor>())
 +            .Where(d => d != null && d.type != UExpressionType.Options)
-+            .OrderBy(d => d.name)
++            .OrderBy(d => Priority(d.abbr))
++            .ThenBy(d => d.abbr, StringComparer.OrdinalIgnoreCase)
 +            .ToList();
 +        _customPresets = LoadCustomPresets();
 +        _presetNames = BuildPresetNames();
@@ -830,6 +873,7 @@ index 0000000..bec4e56
 +        Content = root;
 +
 +        ApplyPreset(0);
++        LoadSavedSettings();
 +    }
 +
 +    #region 界面
@@ -884,6 +928,22 @@ index 0000000..bec4e56
 +            Text = BuildSummaryText(),
 +        };
 +        stack.Children.Add(_summaryLabel);
++
++        stack.Children.Add(SectionTitle("作用范围"));
++        _scopePicker = new Picker
++        {
++            ItemsSource = BuildScopeNames(),
++            SelectedIndex = _selectedNotes.Count > 0 ? 1 : 0,
++        };
++        _scopePicker.SelectedIndexChanged += (s, e) =>
++        {
++            if (_syncing)
++            {
++                return;
++            }
++            RefreshSummary();
++        };
++        stack.Children.Add(_scopePicker);
 +
 +        stack.Children.Add(SectionTitle("预设"));
 +        _presetPicker = new Picker
@@ -940,7 +1000,11 @@ index 0000000..bec4e56
 +        stack.Children.Add(SwitchRow("同时写入表情", _expressionSwitch, "50% 等于表情的默认值"));
 +        foreach (var descriptor in _expressionDescriptors)
 +        {
-+            AddSlider(stack, ExpressionKey(descriptor.abbr), $"{descriptor.name}  {descriptor.abbr}", 0, 100, 50, "%");
++            var info = ExpressionInfo.TryGetValue(descriptor.abbr, out var known)
++                ? known
++                : (Name: descriptor.name, Hint: string.Empty);
++            AddSlider(stack, ExpressionKey(descriptor.abbr), $"{info.Name}  {descriptor.abbr}",
++                0, 100, 50, "%", info.Hint);
 +        }
 +        if (_expressionDescriptors.Count == 0)
 +        {
@@ -951,6 +1015,11 @@ index 0000000..bec4e56
 +                Text = "这个工程没有可写的表情",
 +            });
 +        }
++
++        stack.Children.Add(SectionTitle("高级"));
++        _logSwitch = new Switch { IsToggled = ReadLogPreference(), HorizontalOptions = LayoutOptions.Start };
++        _logSwitch.Toggled += (s, e) => SaveLogPreference(_logSwitch.IsToggled);
++        stack.Children.Add(SwitchRow("记录调试日志", _logSwitch, "写到 Download/DSH-Go/autotune-log.txt，仅排查问题时开"));
 +
 +        stack.Children.Add(new Label
 +        {
@@ -1038,7 +1107,7 @@ index 0000000..bec4e56
 +        return row;
 +    }
 +
-+    private void AddSlider(VerticalStackLayout parent, string key, string title, double min, double max, double value, string unit)
++    private void AddSlider(VerticalStackLayout parent, string key, string title, double min, double max, double value, string unit, string? hint = null)
 +    {
 +        const int decimals = 0;
 +        _values[key] = value;
@@ -1093,6 +1162,16 @@ index 0000000..bec4e56
 +        _sliders[key] = slider;
 +        _valueLabels[key] = valueLabel;
 +        parent.Children.Add(head);
++        if (!string.IsNullOrEmpty(hint))
++        {
++            parent.Children.Add(new Label
++            {
++                Text = hint,
++                FontSize = 11,
++                TextColor = Colors.Gray,
++                Margin = new Thickness(0, 2, 0, 0),
++            });
++        }
 +        parent.Children.Add(slider);
 +    }
 +
@@ -1170,6 +1249,29 @@ index 0000000..bec4e56
 +                        ("vibLength", 60), ("vibPeriod", 150), ("vibDepth", 45), ("vibIn", 15), ("vibOut", 20));
 +                    SetVibrato(true);
 +                    SetExpressions(("dyn", 85), ("tenc", 80));
++                    break;
++                case 10: // 怒音
++                    SetValues(("portamento", 50), ("lead", 10), ("scoop", 30), ("overshoot", 25), ("jitter", 12),
++                        ("vibLength", 45), ("vibPeriod", 165), ("vibDepth", 38), ("vibIn", 10), ("vibOut", 20));
++                    SetVibrato(true);
++                    SetExpressions(("dyn", 90), ("tenc", 85), ("genc", 60), ("brec", 20));
++                    break;
++                case 11: // 哭腔
++                    SetValues(("portamento", 130), ("lead", 60), ("scoop", 90), ("overshoot", 0), ("jitter", 7),
++                        ("vibLength", 55), ("vibPeriod", 210), ("vibDepth", 40), ("vibIn", 35), ("vibOut", 45));
++                    SetVibrato(true);
++                    SetExpressions(("dyn", 55), ("tenc", 40), ("brec", 55), ("genc", 45));
++                    break;
++                case 12: // 温柔
++                    SetValues(("portamento", 110), ("lead", 30), ("scoop", 60), ("overshoot", 0), ("jitter", 3),
++                        ("vibLength", 40), ("vibPeriod", 190), ("vibDepth", 18), ("vibIn", 35), ("vibOut", 40));
++                    SetVibrato(true);
++                    SetExpressions(("dyn", 40), ("tenc", 35), ("brec", 40), ("genc", 45));
++                    break;
++                case 13: // 低语旁白
++                    SetValues(("portamento", 40), ("lead", 0), ("scoop", 15), ("overshoot", 0), ("jitter", 4));
++                    SetVibrato(false);
++                    SetExpressions(("dyn", 30), ("brec", 70), ("vel", 40));
 +                    break;
 +                default: // 自然
 +                    SetValues(("portamento", 80), ("lead", 0), ("scoop", 50), ("overshoot", 0), ("jitter", 6),
@@ -1264,6 +1366,12 @@ index 0000000..bec4e56
 +    }
 +
 +    private static string ExpressionKey(string abbr) => "exp:" + abbr;
++
++    private static int Priority(string abbr)
++    {
++        int index = Array.IndexOf(ExpressionPriority, abbr);
++        return index < 0 ? ExpressionPriority.Length : index;
++    }
 +
 +    /// <summary>收集当前面板上的表情百分比（开关关闭时为空）。</summary>
 +    private Dictionary<string, double> BuildExpressionValues()
@@ -1368,7 +1476,7 @@ index 0000000..bec4e56
 +
 +    private async void OnApplyClicked(object? sender, EventArgs e)
 +    {
-+        if (_notes.Count == 0)
++        if (Notes().Count == 0)
 +        {
 +            return;
 +        }
@@ -1380,7 +1488,8 @@ index 0000000..bec4e56
 +        try
 +        {
 +            var settings = BuildSettings();
-+            var commands = AutoTuneEngine.BuildCommands(project, _part, _notes, settings);
++            var targets = Notes();
++            var commands = AutoTuneEngine.BuildCommands(project, _part, targets, settings);
 +            if (commands.Count == 0)
 +            {
 +                await Toast.Make("没有可调音的音符", ToastDuration.Short).Show();
@@ -1407,10 +1516,14 @@ index 0000000..bec4e56
 +                    ? $" 表情{settings.Expressions.Count}项"
 +                    : " 未写表情");
 +            Log.Information("AutoTune apply: " + summary);
-+            // 写日志放到后台，避免存储权限不对时卡住界面。
-+            string logLine = summary + $" notes={_notes.Count} commands={commands.Count}";
-+            _ = Task.Run(() => WriteApplyLog(logLine));
-+            await Toast.Make($"已调音 {_notes.Count} 个音符 · {summary}", ToastDuration.Long).Show();
++            if (_logSwitch.IsToggled)
++            {
++                // 写日志放到后台，避免存储权限不对时卡住界面。
++                string logLine = summary + $" notes={targets.Count} commands={commands.Count}";
++                _ = Task.Run(() => WriteApplyLog(logLine));
++            }
++            SaveSettings();
++            await Toast.Make($"已调音 {targets.Count} 个音符 · {summary}", ToastDuration.Long).Show();
 +            await Navigation.PopModalAsync();
 +        }
 +        catch (Exception ex)
@@ -1423,6 +1536,90 @@ index 0000000..bec4e56
 +    /// <summary>
 +    /// 把这次实际用到的参数写到手机存储，方便排查「调了却没变化」。
 +    /// </summary>
++    private const string SavedFlagKey = "autotune.p.saved";
++    private const string SavedPrefix = "autotune.p.";
++
++    /// <summary>把当前面板参数记下来，下次打开面板直接还原。</summary>
++    private void SaveSettings()
++    {
++        try
++        {
++            var prefs = Microsoft.Maui.Storage.Preferences.Default;
++            foreach (var pair in _values)
++            {
++                prefs.Set(SavedPrefix + pair.Key, pair.Value);
++            }
++            prefs.Set(SavedPrefix + "vibrato", _vibratoSwitch?.IsToggled ?? true);
++            prefs.Set(SavedPrefix + "expressions", _expressionSwitch?.IsToggled ?? false);
++            prefs.Set(SavedFlagKey, true);
++        }
++        catch (Exception ex)
++        {
++            Log.Warning("保存调音参数失败：{Message}", ex.Message);
++        }
++    }
++
++    private void LoadSavedSettings()
++    {
++        try
++        {
++            var prefs = Microsoft.Maui.Storage.Preferences.Default;
++            if (!prefs.Get(SavedFlagKey, false))
++            {
++                return;
++            }
++            _syncing = true;
++            try
++            {
++                var pairs = new List<(string, double)>();
++                foreach (var key in _values.Keys.ToList())
++                {
++                    double fallback = _defaults.TryGetValue(key, out double def) ? def : _values[key];
++                    pairs.Add((key, prefs.Get(SavedPrefix + key, fallback)));
++                }
++                SetValues(pairs.ToArray());
++                SetVibrato(prefs.Get(SavedPrefix + "vibrato", true));
++                if (_expressionSwitch != null)
++                {
++                    _expressionSwitch.IsToggled = prefs.Get(SavedPrefix + "expressions", false);
++                }
++            }
++            finally
++            {
++                _syncing = false;
++            }
++        }
++        catch (Exception ex)
++        {
++            Log.Warning("恢复调音参数失败：{Message}", ex.Message);
++        }
++    }
++
++    private static bool ReadLogPreference()
++    {
++        try
++        {
++            return Microsoft.Maui.Storage.Preferences.Default.Get(LogPreferenceKey, false);
++        }
++        catch (Exception ex)
++        {
++            Log.Warning("读取日志开关失败：{Message}", ex.Message);
++            return false;
++        }
++    }
++
++    private static void SaveLogPreference(bool enabled)
++    {
++        try
++        {
++            Microsoft.Maui.Storage.Preferences.Default.Set(LogPreferenceKey, enabled);
++        }
++        catch (Exception ex)
++        {
++            Log.Warning("保存日志开关失败：{Message}", ex.Message);
++        }
++    }
++
 +    private void WriteApplyLog(string line)
 +    {
 +        foreach (string dir in new[] { "/sdcard/Download/DSH-Go", "/sdcard/Download", "/sdcard" })
@@ -1444,13 +1641,13 @@ index 0000000..bec4e56
 +
 +    private async void OnClearClicked(object? sender, EventArgs e)
 +    {
-+        if (_notes.Count == 0)
++        if (Notes().Count == 0)
 +        {
 +            return;
 +        }
 +        try
 +        {
-+            var commands = AutoTuneEngine.BuildClearCommands(_part, _notes);
++            var commands = AutoTuneEngine.BuildClearCommands(_part, Notes());
 +            if (commands.Count == 0)
 +            {
 +                return;
@@ -1483,10 +1680,38 @@ index 0000000..bec4e56
 +
 +    private string BuildSummaryText()
 +    {
-+        int singable = _notes.Count(n => !AutoTuneEngine.IsRest(n));
-+        return _notes.Count == 0
-+            ? "当前分片没有可调音的音符"
-+            : $"作用范围：{_notes.Count} 个音符（其中 {singable} 个可发音），未选中时默认整个分片";
++        var notes = Notes();
++        int singable = notes.Count(n => !AutoTuneEngine.IsRest(n));
++        if (notes.Count == 0)
++        {
++            return "当前分片没有可调音的音符";
++        }
++        string scope = _scopePicker?.SelectedIndex == 1 ? "选中的" : "";
++        return $"作用对象：{scope}{notes.Count} 个音符（其中 {singable} 个可发音）";
++    }
++
++    private void RefreshSummary()
++    {
++        if (_summaryLabel != null)
++        {
++            _summaryLabel.Text = BuildSummaryText();
++        }
++    }
++
++    /// <summary>当前作用范围：选中的音符，或者整个分片。</summary>
++    private List<UNote> Notes()
++        => _selectedNotes.Count > 0 && _scopePicker?.SelectedIndex == 1
++            ? _selectedNotes
++            : _notes;
++
++    private List<string> BuildScopeNames()
++    {
++        var names = new List<string> { $"全部音符（{_notes.Count}）" };
++        if (_selectedNotes.Count > 0)
++        {
++            names.Add($"仅选中的 {_selectedNotes.Count} 个");
++        }
++        return names;
 +    }
 +
 +    private static string Format(double value, string unit, int decimals)
@@ -1510,10 +1735,10 @@ index 563fd3f..81e41a8 100644
                                  <Button ImageSource="{DynamicResource magnet}" x:Name="ButtonPianoRollSnapToGrid" Style="{StaticResource CircularToolbarButtonStyle}" Clicked="ButtonPianoRollSnapToGrid_Clicked">
                                      <Button.Behaviors>
 diff --git a/OpenUtauMobile/Views/EditPage.xaml.cs b/OpenUtauMobile/Views/EditPage.xaml.cs
-index 107737b..7d1e43a 100644
+index 107737b..b93221d 100644
 --- a/OpenUtauMobile/Views/EditPage.xaml.cs
 +++ b/OpenUtauMobile/Views/EditPage.xaml.cs
-@@ -2816,6 +2816,25 @@ public partial class EditPage : ContentPage, ICmdSubscriber, IDisposable
+@@ -2816,6 +2816,24 @@ public partial class EditPage : ContentPage, ICmdSubscriber, IDisposable
          }
      }
  
@@ -1526,14 +1751,13 @@ index 107737b..7d1e43a 100644
 +        {
 +            return;
 +        }
-+        List<UNote> notes = _viewModel.SelectedNotes.Count > 0
-+            ? _viewModel.SelectedNotes.ToList()
-+            : part.notes.ToList();
-+        if (notes.Count == 0)
++        List<UNote> allNotes = part.notes.ToList();
++        if (allNotes.Count == 0)
 +        {
 +            return;
 +        }
-+        await Navigation.PushModalAsync(new AutoTunePage(part, notes));
++        List<UNote> selected = _viewModel.SelectedNotes.ToList();
++        await Navigation.PushModalAsync(new AutoTunePage(part, allNotes, null, selected));
 +    }
 +
      public void UpdateRenderProgress(string workId, int renderedPhrases, int totalPhrases)
