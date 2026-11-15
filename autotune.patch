@@ -748,10 +748,10 @@ index 0000000..2e2f5db
 +}
 diff --git a/OpenUtauMobile/Views/AutoTunePage.cs b/OpenUtauMobile/Views/AutoTunePage.cs
 new file mode 100644
-index 0000000..ae93421
+index 0000000..d0f83f5
 --- /dev/null
 +++ b/OpenUtauMobile/Views/AutoTunePage.cs
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,1030 @@
 +using CommunityToolkit.Maui.Alerts;
 +using CommunityToolkit.Maui.Core;
 +using OpenUtau.Core;
@@ -772,6 +772,7 @@ index 0000000..ae93421
 +    private readonly UVoicePart _part;
 +    private readonly List<UNote> _notes;
 +    private readonly List<UNote> _selectedNotes;
++    private readonly string _settingsScope;
 +    private readonly Dictionary<string, Slider> _sliders = new();
 +    private readonly Dictionary<string, double> _values = new();
 +    private readonly Dictionary<string, string> _units = new();
@@ -840,6 +841,7 @@ index 0000000..ae93421
 +        _part = part;
 +        _notes = notes ?? new List<UNote>();
 +        _selectedNotes = selectedNotes?.ToList() ?? new List<UNote>();
++        _settingsScope = DocManager.Inst.Project?.FilePath ?? string.Empty;
 +        Title = "调音";
 +        _expressionDescriptors = (expressions
 +                ?? DocManager.Inst.Project?.expressions.Values.ToList()
@@ -951,6 +953,15 @@ index 0000000..ae93421
 +            ItemsSource = new List<string>(_presetNames),
 +            SelectedIndex = 0,
 +        };
++        var resetButton = new Button
++        {
++            Text = "重置",
++            FontSize = 13,
++            Padding = new Thickness(14, 4),
++            Margin = new Thickness(8, 0, 0, 0),
++            VerticalOptions = LayoutOptions.Center,
++        };
++        resetButton.Clicked += (s, e) => ResetAll();
 +        _presetPicker.SelectedIndexChanged += (s, e) =>
 +        {
 +            if (_syncing)
@@ -966,7 +977,18 @@ index 0000000..ae93421
 +            }
 +            ApplyPreset(index);
 +        };
-+        stack.Children.Add(_presetPicker);
++        var presetRow = new Grid
++        {
++            ColumnDefinitions =
++            {
++                new ColumnDefinition(GridLength.Star),
++                new ColumnDefinition(GridLength.Auto),
++            },
++        };
++        presetRow.Children.Add(_presetPicker);
++        presetRow.Children.Add(resetButton);
++        Grid.SetColumn(resetButton, 1);
++        stack.Children.Add(presetRow);
 +        stack.Children.Add(new Label
 +        {
 +            FontSize = 11,
@@ -1536,8 +1558,46 @@ index 0000000..ae93421
 +    /// <summary>
 +    /// 把这次实际用到的参数写到手机存储，方便排查「调了却没变化」。
 +    /// </summary>
-+    private const string SavedFlagKey = "autotune.p.saved";
 +    private const string SavedPrefix = "autotune.p.";
++
++    /// <summary>
++    /// 记忆按工程文件分开：同一个文件内沿用，换了文件互不影响。
++    /// 用路径的 FNV-1a 短哈希做键，避免超长路径。
++    /// </summary>
++    private string ScopePrefix()
++    {
++        if (string.IsNullOrWhiteSpace(_settingsScope))
++        {
++            return SavedPrefix + "global.";
++        }
++        uint hash = 2166136261;
++        foreach (char c in _settingsScope)
++        {
++            hash = (hash ^ c) * 16777619;
++        }
++        return SavedPrefix + hash.ToString("x8") + ".";
++    }
++
++    /// <summary>把面板恢复到出厂默认（自然预设、表情关闭），并记住这个状态。</summary>
++    private void ResetAll()
++    {
++        _syncing = true;
++        try
++        {
++            _presetPicker.SelectedIndex = 0;
++        }
++        finally
++        {
++            _syncing = false;
++        }
++        ApplyPreset(0);
++        if (_expressionSwitch != null)
++        {
++            _expressionSwitch.IsToggled = false;
++        }
++        SaveSettings();
++        RefreshSummary();
++    }
 +
 +    /// <summary>把当前面板参数记下来，下次打开面板直接还原。</summary>
 +    private void SaveSettings()
@@ -1545,13 +1605,14 @@ index 0000000..ae93421
 +        try
 +        {
 +            var prefs = Microsoft.Maui.Storage.Preferences.Default;
++            string prefix = ScopePrefix();
 +            foreach (var pair in _values)
 +            {
-+                prefs.Set(SavedPrefix + pair.Key, pair.Value);
++                prefs.Set(prefix + pair.Key, pair.Value);
 +            }
-+            prefs.Set(SavedPrefix + "vibrato", _vibratoSwitch?.IsToggled ?? true);
-+            prefs.Set(SavedPrefix + "expressions", _expressionSwitch?.IsToggled ?? false);
-+            prefs.Set(SavedFlagKey, true);
++            prefs.Set(prefix + "vibrato", _vibratoSwitch?.IsToggled ?? true);
++            prefs.Set(prefix + "expressions", _expressionSwitch?.IsToggled ?? false);
++            prefs.Set(prefix + "saved", true);
 +        }
 +        catch (Exception ex)
 +        {
@@ -1564,7 +1625,8 @@ index 0000000..ae93421
 +        try
 +        {
 +            var prefs = Microsoft.Maui.Storage.Preferences.Default;
-+            if (!prefs.Get(SavedFlagKey, false))
++            string prefix = ScopePrefix();
++            if (!prefs.Get(prefix + "saved", false))
 +            {
 +                return;
 +            }
@@ -1575,13 +1637,13 @@ index 0000000..ae93421
 +                foreach (var key in _values.Keys.ToList())
 +                {
 +                    double fallback = _defaults.TryGetValue(key, out double def) ? def : _values[key];
-+                    pairs.Add((key, prefs.Get(SavedPrefix + key, fallback)));
++                    pairs.Add((key, prefs.Get(prefix + key, fallback)));
 +                }
 +                SetValues(pairs.ToArray());
-+                SetVibrato(prefs.Get(SavedPrefix + "vibrato", true));
++                SetVibrato(prefs.Get(prefix + "vibrato", true));
 +                if (_expressionSwitch != null)
 +                {
-+                    _expressionSwitch.IsToggled = prefs.Get(SavedPrefix + "expressions", false);
++                    _expressionSwitch.IsToggled = prefs.Get(prefix + "expressions", false);
 +                }
 +            }
 +            finally
